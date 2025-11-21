@@ -1,0 +1,62 @@
+#  Configuration for scRNA-seq imputation model reported in paper
+
+# Data configuration
+data:
+  dataset: 'scrna'  # Dataset type
+  data_path: 'data/dnadiff/filtered_hca_data.hdf5'  # Path to processed HDF5 file
+  condition_keys:
+    - cell_type
+    - disease
+    - sex
+    - batch
+    - development_day
+
+  
+# Model configuration
+model:
+  model_type: 'attention1d'
+  
+  # AttentionWrapper parameters
+  input_dim: 1  # Input dimension for gene expression values
+  output_dim: 1  # Output dimension for predicted birth rates
+  embed_dim: 64  # Embedding dimension
+  num_heads: 4  # Number of attention heads
+  num_layers: 3  # Number of transformer layers
+  dropout: 0.1  # Dropout rate
+  batch_first: true
+  
+  # Conditional training parameters
+  p_uncond: 0.2  # No unconditional training for scRNA-seq (always conditioned on cell type and batch)
+
+# Training configuration
+training:
+  batch_size: 512  # Smaller batch size for memory efficiency with attention
+  n_steps: 100000  # Total training steps
+  lr: 0.0002  # Learning rate
+  
+  # Learning rate schedule
+  warmup: 1000  # Warmup steps
+  beta1: 0.9  # Adam beta1
+  weight_decay: 0.0
+  
+  # EMA configuration
+  ema_rate: 0.9999  # Exponential moving average rate
+  
+  # Logging and evaluation
+  log_freq: 1000  # Log every N steps
+  snapshot_freq_preemption: 1000  # Save checkpoint every N steps for preemption
+  snapshot_freq: 10000  # Save checkpoint every N steps
+  
+  # Gradient clipping
+  gradient_clip: 1.0  # Gradient clipping threshold
+  
+  # Random seed
+  random_seed: 42
+  
+  # Checkpoint directory
+  checkpoint_dir: 'data/dnadiff/checkpoints/scrna'
+  debug: False
+
+scheduler:
+  scheduler: "cosine"
+  continuous: True

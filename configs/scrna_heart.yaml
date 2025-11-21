@@ -1,0 +1,75 @@
+#  Configuration for scRNA-seq imputation model reported in paper
+
+# Data configuration
+data:
+  dataset: 'scrna'  # Dataset type
+  data_path: 'data/dnadiff/filtered_heart_data.hdf5'  # Path to processed HDF5 file
+  condition_keys:
+    - cell_type
+    - batch
+    - gender
+    - age
+
+  
+# Model configuration
+model:
+  model_type: 'attention1d'
+  
+  # AttentionWrapper parameters
+  input_dim: 1  # Input dimension for gene expression values
+  output_dim: 1  # Output dimension for predicted birth rates
+  embed_dim: 128  # Embedding dimension
+  num_heads: 8  # Number of attention heads
+  num_layers: 3  # Number of transformer layers
+  dropout: 0.1  # Dropout rate
+  
+  # Conditional training parameters
+  p_uncond: 0.2 
+
+# Training configuration
+training:
+  batch_size: 512  # Smaller batch size for memory efficiency with attention
+  n_steps: 50000  # Total training steps
+  lr: 0.0002  # Learning rate
+  
+  # Learning rate schedule
+  warmup: 1000  # Warmup steps
+  beta1: 0.9  # Adam beta1
+  weight_decay: 0.0001  
+  
+  # EMA configuration
+  ema_rate: 0.999  # Exponential moving average rate
+  
+  # Logging and evaluation
+  log_freq: 1000  # Log every N steps
+  snapshot_freq_preemption: 100  # Save checkpoint every N steps for preemption
+  snapshot_freq: 1000  # Save checkpoint every N steps
+  eval_freq: 10000
+  start_eval: 5000
+  # Gradient clipping
+  gradient_clip: 1.0  # Gradient clipping threshold
+  
+  # Random seed
+  random_seed: 42
+  
+  # Checkpoint directory
+  checkpoint_dir: 'data/dnadiff/checkpoints/scrna'
+  debug: False
+  tags: 
+    -'yes_batch'
+    -'heart'
+  
+generation:
+  num_samples: 5000  # Number of samples to generate
+  n_steps: 100  # Number of diffusion steps during generation
+  device: "cuda"  # Device for generation
+  remasking_prob: 0.0  # Probability of remasking during generation
+  sigma_method: rescaled  # Sigma method for generation
+  sigma_kwargs:
+    eta_rescale: 0.005
+  guidance_scale: 1.0  # Guidance scale for classifier-free guidance
+  batch_size: 500
+
+scheduler:
+  scheduler: "cosine"
+  continuous: True

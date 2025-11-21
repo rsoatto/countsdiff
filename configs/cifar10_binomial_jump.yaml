@@ -1,0 +1,73 @@
+# CIFAR-10 Blackout Diffusion Configuration
+# Matching NCSN++ default settings as closely as possible
+# Key changes: dropout=0.1, centered=false, random_flip=true, gradient_clip=1.0
+
+experiment:
+  name: "binomial_JUMP_diffusion_cifar10"
+  tags: ["cifar10", "binomial_JUMP", "diffusion"]
+
+training:
+  random_seed: 42
+  batch_size: 256          
+  n_steps: 500000        
+  lr: 0.0002               
+  device: "cuda"
+  checkpoint_dir: "data/dnadiff/checkpoints/cifar10"
+  snapshot_freq: 100000     # Match reference snapshot_freq
+  snapshot_freq_preemption: 1000  # Match reference snapshot_freq_for_preemption
+  log_freq: 5000            
+  eval_freq: 100000
+  start_eval: 0
+  ema_rate: 0.9999         
+  gradient_clip: 1.0
+  tags: ["cifar10", "4_layers", "binomial_JUMP"]
+
+  beta1: 0.9               # Adam beta1 parameter
+  eps: 1.0e-8              # Adam epsilon parameter  
+  weight_decay: 0          # L2 regularization (0 = no weight decay)
+  warmup: 5000             # Learning rate warmup steps
+  debug: false
+
+
+model: #Unet 2d defaults are from DDPM for CIFAR-10
+  model_type: "2d"         # Use 2D UNet for images
+  class_embed_type: "none"
+  block_out_channels: [128, 256, 256, 256]
+  down_block_types: ["DownBlock2D", "AttnDownBlock2D", "DownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "UpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+  layers_per_block: 4
+  dropout: 0.1
+  p_uncond: null            # Unconditional probability
+  num_classes: null          # Number of classes for CIFAR-10
+  pred_target: "x0"
+
+# Data configuration - Matching NCSN++ settings  
+data:
+  dataset: "cifar10"
+  data_path: null          # CIFAR-10 will be downloaded automatically
+  image_size: 32           # Match NCSN++
+  num_channels: 3          # Match NCSN++
+  centered: false           
+  random_flip: true        # Match NCSN++ random_flip: true
+  
+# Scheduler configuration
+scheduler:
+  scheduler: "jump"           # Jump noise schedule from ddpm
+  T: 1000
+  beta_start: 0.0001
+  logsnr_start: 10.0
+  logsnr_end: -12.0
+  signal_stat: 120.7 # Estimated from CIFAR-10 training set
+  poisson_randomization: false
+  continuous: false
+
+
+generation:
+  num_samples: 5000
+  n_steps: 1000
+  device: "cuda"
+  remasking_prob: 0.0
+  random_rounding: false
+  poisson_sampling: true
+  sigma_method: null
+  guidance_scale: null

@@ -1,0 +1,53 @@
+# CIFAR-10 Blackout Diffusion Configuration
+# Matching NCSN++ default settings as closely as possible
+# Key changes: dropout=0.1, centered=false, random_flip=true, gradient_clip=1.0
+
+experiment:
+  name: "blackout_diffusion_cifar10_conditional"
+  tags: ["cifar10", "blackout", "diffusion"]
+
+training:
+  random_seed: 42
+  batch_size: 256          
+  n_steps: 1300000        
+  lr: 0.0002               
+  device: "cuda"
+  checkpoint_dir: "data/dnadiff/checkpoints/cifar10"
+  snapshot_freq: 10000     # Match reference snapshot_freq
+  snapshot_freq_preemption: 1000  # Match reference snapshot_freq_for_preemption
+  log_freq: 100            
+  eval_freq: 50000          
+  ema_rate: 0.9999         
+  gradient_clip: 1.0       
+  tags: ["cifar10", "4_layers", "cosine"]
+  
+  beta1: 0.9               # Adam beta1 parameter
+  eps: 1.0e-8              # Adam epsilon parameter  
+  weight_decay: 0          # L2 regularization (0 = no weight decay)
+  warmup: 5000             # Learning rate warmup steps
+
+
+
+model: #Unet 2d defaults are from DDPM for CIFAR-10
+  model_type: "2d"         # Use 2D UNet for images
+  class_embed_type: "identity"
+  block_out_channels: [128, 256, 256, 256]
+  down_block_types: ["DownBlock2D", "AttnDownBlock2D", "DownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "UpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+  layers_per_block: 4
+  dropout: 0.1
+  p_uncond: 0.2            # Unconditional probability
+  num_classes: 10          # Number of classes for CIFAR-10
+
+# Data configuration - Matching NCSN++ settings  
+data:
+  dataset: "cifar10"
+  data_path: null          # CIFAR-10 will be downloaded automatically
+  image_size: 32           # Match NCSN++
+  num_channels: 3          # Match NCSN++
+  centered: false           # Match NCSN++ - normalize to [-1, 1] range
+  random_flip: true        # Match NCSN++ random_flip: true
+  
+# Scheduler configuration
+scheduler:
+  type: "cosine"           # Cosine noise schedule

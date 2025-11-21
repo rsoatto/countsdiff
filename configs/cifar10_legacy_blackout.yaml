@@ -1,0 +1,56 @@
+#Re-implementation of BlackoutDiffusion as a special case of CountsDiff
+experiment:
+  name: "blackout_diffusion_cifar10_conditional_legacy_blackout"
+  tags: ["cifar10", "blackout", "legacy_blackout"]
+
+training:
+  random_seed: 42
+  batch_size: 256
+  n_steps: 300000
+  lr: 0.0002
+  device: "cuda"
+  checkpoint_dir: "data/dnadiff/checkpoints/cifar10"
+  snapshot_freq: 10000
+  snapshot_freq_preemption: 100
+  log_freq: 100
+  eval_freq: 100000
+  eval_start: 100000
+  ema_rate: 0.9999
+  gradient_clip: 1.0
+  beta1: 0.9
+  eps: 1.0e-8
+  weight_decay: 0
+  warmup: 2000
+  debug: False
+
+generation:
+  num_samples: 5000
+  n_steps: 1000
+  device: "cuda" 
+  remasking_prob: 0.0
+  sigma_method: null
+  
+
+scheduler:
+  scheduler: "blackout"
+  continuous: False
+
+model:
+  model_type: "2d"
+  class_embed_type: "none"
+  block_out_channels: [128, 256, 256, 256]
+  down_block_types: ["DownBlock2D", "AttnDownBlock2D", "DownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "UpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+  dropout: 0.0
+  num_classes: null
+  p_uncond: null
+
+data:
+  dataset: "cifar10"
+  data_path: null
+  image_size: 32
+  num_channels: 3
+  centered: false
+  random_flip: true
+
+

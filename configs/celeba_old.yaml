@@ -1,0 +1,61 @@
+# Configuration used for paper results on CelebA (small model)
+
+experiment:
+  name: "blackout_diffusion_celeba"
+  tags: ["celeba", "blackout", "diffusion"]
+
+training:
+  random_seed: 42
+  batch_size: 64
+  n_steps: 1300000
+  lr: 0.0002
+  device: "cuda"
+  checkpoint_dir: "data/dnadiff/checkpoints/celeba"
+  snapshot_freq: 10000
+  snapshot_freq_preemption: 2000
+  log_freq: 1000
+  eval_freq: 100000
+  ema_rate: 0.9999
+  gradient_clip: 1.0
+  beta1: 0.9
+  eps: 1.0e-8
+  weight_decay: 0
+  warmup: 2000
+  debug: False
+
+scheduler:
+  scheduler: "cosine"
+  continuous: True
+
+model:
+  model_type: "2d"
+  class_embed_type: "identity"
+  block_out_channels: [128, 256, 256, 256]
+  down_block_types: ["DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
+  dropout: 0.1
+  num_classes: null
+  p_uncond: 0.1
+  multi_label: true
+  num_attributes: 40
+
+data:
+  dataset: "celeba"
+  data_path: null
+  image_size: 64
+  num_channels: 3
+  centered: false
+  random_flip: true
+
+generation:
+  num_samples: 5000
+  n_steps: 1000
+  device: "cuda"
+  remasking_prob: 0.0
+  sigma_method: null
+  guidance_scale: 1.5
+
+neptune:
+  project: null
+  api_token: null
+  enabled: false
