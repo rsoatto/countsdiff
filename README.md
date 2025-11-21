@@ -8,10 +8,8 @@ A diffusion model on the natural numbers for generation and imputation of count-
 
 First, make sure you have Python 3.11 and pip installed. Then, in the root directory, run:
 ```bash
-
 # Install the package
 pip install -e .
-
 ```
 
 The `data/` directory is intentionally empty in this repository to keep the artifact size manageable.
@@ -20,7 +18,7 @@ To download the full dataset, checkpoint, and experimental results (i.e. hyperpa
 
 ```bash
 bash scripts/download_data.sh
-
+```
 ## File Structure
 
 ```
