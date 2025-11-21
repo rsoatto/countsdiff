@@ -1,5 +1,5 @@
 """
-Main generator class for SNP diffusion models
+Main generator class for CountsDiff models
 """
 
 import os

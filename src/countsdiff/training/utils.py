@@ -1,5 +1,5 @@
 """
-Training utilities for SNP diffusion models
+Training utilities for CountsDiff models
 """
 
 import torch

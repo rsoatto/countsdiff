@@ -1,5 +1,5 @@
 """
-Configuration handling for SNP Diffusion
+Configuration handling for CountsDiff
 """
 
 import ast

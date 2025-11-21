@@ -1,5 +1,5 @@
 """
-Generation module for SNP diffusion models
+Generation module for CountsDiff models
 """
 
 from .generator import CountsdiffGenerator

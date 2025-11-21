@@ -1,5 +1,5 @@
 """
-Main trainer class for SNP diffusion models
+Main trainer class for CountsDiff models
 """
 
 import os

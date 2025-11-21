@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Setup script for SNP Blackout Diffusion package
+Setup script for CountsDiff package
 """
 
 from setuptools import setup, find_packages
@@ -76,10 +76,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "snp-train=countsdiff.cli:train_cli",
-            "snp-generate=countsdiff.cli:generate_cli", 
             "countsdiff=countsdiff.cli:main",
-            "snp-preprocess=countsdiff.data.preprocessing:preprocess_cli",
         ],
     },
     include_package_data=True,

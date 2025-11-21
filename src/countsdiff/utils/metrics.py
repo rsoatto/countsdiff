@@ -1,5 +1,5 @@
 """
-Evaluation metrics for SNP diffusion models
+Evaluation metrics for CountsDiff models
 """
 
 import numpy as np

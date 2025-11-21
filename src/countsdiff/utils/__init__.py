@@ -1,5 +1,5 @@
 """
-Utility functions for SNP diffusion package
+Utility functions for CountsDiff package
 """
 
 from .checkpoints import save_checkpoint_with_sum, restore_checkpoint_with_sum

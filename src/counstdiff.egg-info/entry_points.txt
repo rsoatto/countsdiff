@@ -1,5 +1,2 @@
 [console_scripts]
 countsdiff = countsdiff.cli:main
-snp-generate = countsdiff.cli:generate_cli
-snp-preprocess = countsdiff.data.preprocessing:preprocess_cli
-snp-train = countsdiff.cli:train_cli

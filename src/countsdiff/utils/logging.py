@@ -1,5 +1,5 @@
 """
-Logging utilities for SNP diffusion package
+Logging utilities for CountsDiff package
 """
 
 import logging

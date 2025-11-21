@@ -1,5 +1,5 @@
 """
-Command-line interface for SNP diffusion package
+Command-line interface for CountsDiff package
 """
 
 import argparse

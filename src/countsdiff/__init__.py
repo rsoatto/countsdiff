@@ -1,17 +1,14 @@
 """
-SNP Blackout Diffusion Package
+CountsDiff Package
 
-A modular package for training and generating SNP data using blackout diffusion models.
-Supports hierarchical generation across different SNP levels (0, 1, 2).
+A modular package for training and generating count-based data using diffusion models.
 """
 
 __version__ = "0.1.0"
-__author__ = "SNP Diffusion Team"
-__email__ = "team@snpdiffusion.com"
+__author__ = "CountsDiff Team"
 
 # Core models and data
 from .models.diffusion import Countsdiff
-# from .data.datasets import SNPDataset
 from .config.config import Config
 
 # Training components
@@ -31,7 +28,6 @@ from . import cli
 __all__ = [
     # Core components
     "Countsdiff",
-    "SNPDataset",
     "Config",
     
     # Training
@@ -39,7 +35,7 @@ __all__ = [
     "training_utils",
     
     # Generation
-    "SNPGenerator",
+    "CountsdiffGenerator",
     "sampling",
     
     # Utilities

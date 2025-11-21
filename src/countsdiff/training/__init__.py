@@ -1,5 +1,5 @@
 """
-Training module for SNP diffusion models
+Training module for CountsDiff models
 """
 
 from .trainer import CountsdiffTrainer

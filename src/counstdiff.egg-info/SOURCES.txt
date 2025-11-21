@@ -2,15 +2,11 @@ README.md
 setup.py
 baselines/__init__.py
 src/counstdiff.egg-info/PKG-INFO
-src/counstdiff.egg-info/PKG-INFO.sync-conflict-20251008-145906-QHIJ6WJ
-src/counstdiff.egg-info/SOURCES.sync-conflict-20251008-145906-QHIJ6WJ.txt
 src/counstdiff.egg-info/SOURCES.txt
 src/counstdiff.egg-info/dependency_links.txt
-src/counstdiff.egg-info/entry_points.sync-conflict-20251008-145906-QHIJ6WJ.txt
 src/counstdiff.egg-info/entry_points.txt
 src/counstdiff.egg-info/not-zip-safe
 src/counstdiff.egg-info/requires.txt
-src/counstdiff.egg-info/top_level.sync-conflict-20251008-145906-QHIJ6WJ.txt
 src/counstdiff.egg-info/top_level.txt
 src/countsdiff/__init__.py
 src/countsdiff/cli.py

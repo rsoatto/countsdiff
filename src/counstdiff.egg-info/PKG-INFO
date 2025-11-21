@@ -42,6 +42,7 @@ Requires-Dist: black>=21.0.0
 Requires-Dist: flake8>=3.9.0
 Requires-Dist: wrapt>=1.17.3
 Requires-Dist: magic-impute
+Requires-Dist: awscli
 Provides-Extra: dev
 Requires-Dist: pytest>=6.0; extra == "dev"
 Requires-Dist: black>=21.0; extra == "dev"
@@ -78,6 +79,13 @@ pip install -e .
 
 ```
 
+The `data/` directory is intentionally empty in this repository to keep the artifact size manageable.
+
+To download the full dataset, checkpoint, and experimental results (i.e. hyperparameter sweeps) (~20GB compressed, ~50GB uncompressed), run:
+
+```bash
+bash scripts/download_data.sh
+
 ## File Structure
 
 ```
@@ -85,7 +93,7 @@ README.md
 configs/          # Various training configuration files
 data/dnadiff/           # Data files and checkpoints
   checkpoints/   # Pretrained model checkpoints
-  evals/        # Evaluation results, from running evaluation scripts in scripts/
+  evals/        # Image evaluation results, from running evaluation scripts in scripts/
   random_masks/  # Precomputed random masks for imputation experiments
   filtered_hca_data.hdf5 # Preprocessed fetus scRNA-seq data
   filtered_heart_data.hdf5 # Preprocessed heart scRNA-seq data
@@ -108,6 +116,13 @@ Train models using the CLI. For example, to train on cifar10 on GPU 0, run
 ```bash
 countsdiff train --config configs/cifar10.yaml
 ```
+
+To resume training from a checkpoint, use the continue argument:
+
+```bash
+countsdiff continue --run-id <RUN_ID> 
+```
+
 
 
 
