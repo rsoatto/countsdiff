@@ -14,6 +14,13 @@ pip install -e .
 
 ```
 
+The `data/` directory is intentionally empty in this repository to keep the artifact size manageable.
+
+To download the full dataset, checkpoint, and experimental results (i.e. hyperparameter sweeps) (~20GB compressed, ~50GB uncompressed), run:
+
+```bash
+bash scripts/download_data.sh
+
 ## File Structure
 
 ```
