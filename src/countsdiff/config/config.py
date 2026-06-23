@@ -2,12 +2,12 @@
 Configuration handling for CountsDiff
 """
 
-import ast
 import os
 import yaml
 from typing import Dict, Any, Optional
 from pathlib import Path
-import neptune
+
+from countsdiff.utils.tracking import normalize_config_literals, resolve_run_reference
 
 
 class Config:
@@ -50,38 +50,26 @@ class Config:
         Recursively convert stringified Python literals (lists, dicts, tuples, numbers, booleans)
         into real Python objects. Leaves non-literal strings unchanged.
         """
-        if isinstance(obj, dict):
-           return {k: Config._normalize_config_literals(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [Config._normalize_config_literals(v) for v in obj]
-        if isinstance(obj, str):
-            s = obj.strip()
-            try:
-                # Safely parse only if it's a Python literal; otherwise keep as-is
-                parsed = ast.literal_eval(s)
-            except Exception:
-                return obj
-            else:
-                return Config._normalize_config_literals(parsed)
-        return obj
+        return normalize_config_literals(obj)
 
     @staticmethod
-    def load_from_neptune(run_id: str, project_name) -> Dict[str, Any]:
-        """Load configuration from a Neptune run"""
-        
-        print(f"Connecting to Neptune run {project_name}/{run_id}")
-        run = neptune.init_run(with_id=run_id, project=project_name, mode='read-only')
-        print("Successfully connected to Neptune")
-        
-        # Extract configuration
-        config = {}
-        # Try to get the config directly
-        config = run["config"].fetch()
+    def load_from_wandb(run_id: str, project_name: Optional[str] = None) -> Dict[str, Any]:
+        """Load configuration from a public W&B run without requiring an API key."""
+        resolved = resolve_run_reference(run_id)
+        print(f"Connecting to W&B run {resolved.run_path}")
+        print("Successfully connected to W&B")
+        print(f"Loaded configuration from W&B run {resolved.run_path}")
+        return Config._normalize_config_literals(resolved.config)
 
-        print(f"Loaded configuration from Neptune run {project_name}/{run_id}")
-        config = Config._normalize_config_literals(config)
-        run.stop()
-        return config
+    @staticmethod
+    def load_from_run(run_id: str, project_name: Optional[str] = None) -> Dict[str, Any]:
+        """Load configuration from the canonical experiment tracker."""
+        return Config.load_from_wandb(run_id, project_name=project_name)
+
+    @staticmethod
+    def load_from_neptune(run_id: str, project_name=None) -> Dict[str, Any]:
+        """Backward-compatible alias for legacy Neptune-based callers."""
+        return Config.load_from_wandb(run_id, project_name=project_name)
 
 
     @staticmethod
