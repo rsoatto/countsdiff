@@ -141,7 +141,7 @@ CITE_LIST = (
     "GAIN~\\citep{yoon2018gain}, Hi-VAE~\\citep{nazabal2020handling}, "
     "scGPT~\\citep{cui2024scgpt}, xTrimoGene~\\citep{gong2023xtrimogene}, "
     "Forest-Diffusion~\\citep{jolicoeur2024generating}, ReMDM~\\citep{wang2025remaskingdiscretediffusionmodels}, "
-    "Blackout Diffusion~\\\citep{santos2023blackout}"
+    "Blackout Diffusion~\\citep{santos2023blackout}"
     "Methods are grouped into three categories: naive baseline (top), scRNAseq/imputation-specific (middle), "
     "and general generative (bottom). Best performance in each category for each metric is bolded, "
     "and second best is italicized."
