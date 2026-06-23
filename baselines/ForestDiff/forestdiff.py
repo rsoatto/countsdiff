@@ -4,13 +4,14 @@ import numpy as np
 from ForestDiffusion import ForestDiffusionModel
 
 class ForestDiffusionWrapper(nn.Module):
-    def __init__(self, n_t=20, duplicate_K=100, repaint_iters=5, repaint_j=2, n_jobs = -1):
+    def __init__(self, n_t=20, duplicate_K=100, repaint_iters=5, repaint_j=2, n_jobs=-1, gpu_hist=False):
         super(ForestDiffusionWrapper, self).__init__()
         self.repaint_iters = repaint_iters
         self.repaint_j = repaint_j
         self.n_t = n_t
         self.duplicate_K = duplicate_K
         self.n_jobs = n_jobs
+        self.gpu_hist = gpu_hist
         
         
     def impute_data(self, counts, impute_mask, gene_names, valid_mask=None, labels=None):
@@ -31,7 +32,9 @@ class ForestDiffusionWrapper(nn.Module):
         counts[impute_and_invalid] = np.nan
         labels = np.stack(labels, axis=1) if labels is not None else None
         Xy = np.concatenate([counts, labels], axis=1) if labels is not None else counts
-        forest_model = ForestDiffusionModel(Xy, n_t=self.n_t, duplicate_K=self.duplicate_K, int_indices=list(range(num_genes)), cat_indices=list(range(num_genes, Xy.shape[1])), diffusion_type='vp', n_jobs = self.n_jobs) 
+        print(f"[forestdiff] starting ForestDiffusionModel fit: n_t={self.n_t}, duplicate_K={self.duplicate_K}, n_jobs={self.n_jobs}, gpu_hist={self.gpu_hist}, X shape={Xy.shape}", flush=True)
+        forest_model = ForestDiffusionModel(Xy, n_t=self.n_t, duplicate_K=self.duplicate_K, int_indices=list(range(num_genes)), cat_indices=list(range(num_genes, Xy.shape[1])), diffusion_type='vp', n_jobs=self.n_jobs, gpu_hist=self.gpu_hist)
+        print(f"[forestdiff] fit complete, starting impute", flush=True)
         
         imputed_full_data = forest_model.impute(repaint=True, r=self.repaint_iters, j=self.repaint_j, k=1)
         imputed_data =  imputed_full_data[:, :num_genes]

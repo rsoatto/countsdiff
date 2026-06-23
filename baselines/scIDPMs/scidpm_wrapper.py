@@ -19,8 +19,10 @@ class scIDPMWrapper():
                  batch_size = 72,
                  missing_ratio = 0.1,
                  impute_mask = None,
-                 n_sample = 1):
-        
+                 n_sample = 1,
+                 seed = 0):
+        self.seed = seed
+
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
         self.model = scIDPMs(config, device).to(device)
@@ -29,15 +31,19 @@ class scIDPMWrapper():
         checkpoint = torch.load(ckpt_file, map_location=device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.test_set = SingleCellDatasetBaselines(data_dir, "test", None, missing_ratio = missing_ratio, imputation_mask = impute_mask)
+        # WARNING: this mutates test_set.counts in-place to scaled [0,1] space.
+        # After this line, test_set.counts is NOT true counts. Callers needing
+        # original counts must invert: np.round(np.abs(counts * (max_arr+1) - 1)) * observed_mask
         self.test_set.counts = ((self.test_set.counts - 0 + 1)/(max_arr - 0 + 1)) * self.test_set.observed_mask
         self.test_loader = DataLoader(self.test_set, batch_size = batch_size)
 
     def impute_data(self):
         imputed_data = genera(self.model,
             self.test_loader,
-            nsample = self.n_sample, 
-            max_arr= self.max_arr, 
-            gene_names = self.test_set.gene_names)
+            nsample = self.n_sample,
+            max_arr= self.max_arr,
+            gene_names = self.test_set.gene_names,
+            seed = self.seed)
         
         return imputed_data, self.test_set
 
