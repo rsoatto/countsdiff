@@ -55,7 +55,7 @@ generation:
   sigma_method: null
   guidance_scale: 1.5
 
-neptune:
-  project: null
-  api_token: null
+# Weights & Biases logging (optional); entity/project are set in
+# countsdiff/utils/tracking.py. Set enabled: true to log training runs.
+wandb:
   enabled: false
