@@ -19,10 +19,10 @@ import wandb
 import yaml
 
 
-WANDB_ENTITY = "rsoatto"
+WANDB_ENTITY = "anonymous2-icml"
 WANDB_PROJECT = "countsdiff-icml"
 WANDB_PROJECT_PATH = f"{WANDB_ENTITY}/{WANDB_PROJECT}"
-WANDB_WRITE_KEY_ENV = "WANDB_API_KEY_ANON"
+WANDB_WRITE_KEY_ENV = "WANDB_API_KEY"
 _CONFIG_NAMESPACE_PREFIX = "config_"
 _CONFIG_SECTIONS = {"model", "data", "scheduler", "training", "generation", "tracking"}
 
