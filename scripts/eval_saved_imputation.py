@@ -14,7 +14,7 @@ def get_args():
     parser = argparse.ArgumentParser(description = "imputation")
     parser.add_argument("--baseline_model", type = str, default = None,
                         help = "baseline model choice, e.g: magic, gain, etc",
-                        choices=["magic", "scidpm", "remdm", "remdm_full", "countsdiff", "mean"])
+                        choices=["magic", "gain", "hivae", "raw", "scidpm", "remdm", "remdm_full", "countsdiff", "mean", "conditional_mean", "scgpt_scratch", "scgpt_pretrained", "xtrimogene", "forestdiff"])
     
     parser.add_argument("--data_type", type = str, 
                         default = "fetus",
@@ -29,11 +29,19 @@ def get_args():
     parser.add_argument("--dropout", type = float, default = 0.5)
     
     parser.add_argument("--data_path", type = str, default = None)
-    
+    parser.add_argument("--mask-file", dest="mask_file_override", type = str, default = None,
+                        help = "Override the mask path. Required when the imputation was generated with a "
+                               "non-default mask (e.g. greycen's row-aligned mask for the .pt forest outputs).")
+
     parser.add_argument("--n_resamples", type = int, default = 10,
                         help = "number of resamples to compute metrics")
 
     parser.add_argument("--zero-shot", action="store_true", help = "whether to use zero-shot setting")
+    parser.add_argument(
+        "--round-distribution-metrics",
+        action="store_true",
+        help="Round imputed values to nonnegative counts for distributional metrics only (energy distance, scFID, MMD, SWD).",
+    )
 
     args = parser.parse_args()
     return args
@@ -41,7 +49,8 @@ def get_args():
 def main():
     args = get_args()
 
-    assert args.baseline_model in {"magic", "gain", "misgan", "forestdiff", "scidpm", "countsdiff", "mean", "conditional_mean", "remdm", "remdm_full"}
+    assert args.baseline_model in {"magic", "gain", "hivae", "raw", "forestdiff", "scidpm", "countsdiff", "mean", "conditional_mean", "remdm", "remdm_full", "scgpt_scratch", "scgpt_pretrained", "xtrimogene"}
+    # forestdiff is generated with the matching `--baseline_model forestdiff` in generate_multiple_imputation.py
 
     assert args.data_type in {"fetus", "heart", "zero_shot"}
 
@@ -51,8 +60,9 @@ def main():
     if args.data_type == "heart":
         args.data_file = f'data/dnadiff/filtered_heart_data.hdf5'
         args.cond_keys = ["batch", "cell_type", "gender", "age"]
-    if args.mask_type == "MNAR_low":
-        args.mask_file = f'data/dnadiff/random_masks/{args.mask_type}_masks/{args.data_type}_dropout_{args.dropout}_low.npy'
+    if args.mask_file_override is not None:
+        args.mask_file = args.mask_file_override
+        print(f"Using mask-file override: {args.mask_file}")
     else:
         args.mask_file = f'data/dnadiff/random_masks/{args.mask_type}_masks/{args.data_type}_dropout_{args.dropout}.npy'
     if not os.path.exists(args.save_dir):
@@ -93,7 +103,18 @@ def main():
         n_samples = 20000
     print(f"Aggregating {num_imputations} imputations...")
     aggregated_results = np.mean(imputed_data_multi, axis = -1)
-    results = compute_resampled_eval(scfid, aggregated_results, test_data.counts, target_mask, test_data.get_obs_dict(), n_samples, n_resamples = args.n_resamples)
+    if args.round_distribution_metrics:
+        print("Rounding nonnegative copies of imputed values for distributional metrics only.")
+    results = compute_resampled_eval(
+        scfid,
+        aggregated_results,
+        test_data.counts,
+        target_mask,
+        test_data.get_obs_dict(),
+        n_samples,
+        n_resamples=args.n_resamples,
+        round_distribution_metrics=args.round_distribution_metrics,
+    )
     scfid.reset()
     json.dump(results, open(f"{args.save_dir}/results_{args.baseline_model}_{args.data_type}_{args.mask_type}_{args.dropout}_{num_imputations}imputations.json", "w"))
     print(f"Results saved to {args.save_dir}/results_{args.baseline_model}_{args.data_type}_{args.mask_type}_{args.dropout}_{num_imputations}imputations.json")
