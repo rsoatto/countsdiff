@@ -70,8 +70,8 @@ setup(
             "jupyter>=1.0",
             "notebook>=6.0",
         ],
-        "neptune": [
-            "neptune-client>=0.16.0",
+        "wandb": [
+            "wandb>=0.25.0",
         ],
     },
     entry_points={
