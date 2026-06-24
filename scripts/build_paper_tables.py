@@ -270,7 +270,7 @@ def emit_appendix_latex(idx):
         out.append(f"\\label{{{labels[(ds,mask,drop)]}}}")
         out.append("\\begin{tabular}{l cccccc c cccc}")
         out.append("\\toprule")
-        out.append(" & \\multicolumn{6}{c}{\\textbf{Sample-level}} & & \\multicolumn{4}{c}{\\textbf{Distributional}} \\\\")
+        out.append(" & \\multicolumn{6}{c}{\\textbf{Pointwise}} & & \\multicolumn{4}{c}{\\textbf{Distributional}} \\\\")
         out.append("\\cmidrule(lr){2-7}\\cmidrule(lr){9-12}")
         out.append("\\textbf{Method} & R$^2\\uparrow$ & RMSE$\\downarrow$ & MAE$\\downarrow$ & Bias & Spearman$\\uparrow$ & Pearson$\\uparrow$ & & ED$\\downarrow$ & log(scFID)$\\downarrow$ & log(MMD)$\\downarrow$ & SWD$\\downarrow$ \\\\")
         out.append("\\midrule")
