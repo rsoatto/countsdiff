@@ -7,7 +7,7 @@ JSONs (10 keys incl. energy_distance/mmd/swd/pearson), and for each
 blackout/ folder's model is relabeled <model>_blackout.
 
 Emits, per task: an availability matrix, a MAIN table (7 cols, grouped
-sample-level | distributional), and an APPENDIX table (all metrics).
+pointwise | distributional), and an APPENDIX table (all metrics).
 Reports mean (standard error) over resamples; scFID and MMD are both shown
 as natural log (log(scFID), log(MMD)) to handle their wide dynamic range.
 """
@@ -41,8 +41,8 @@ GROUPS = [
         ("scIDPMs, 1-sample", "scidpm", "1"),
         ("scIDPMs, 5-sample", "scidpm", "5"),
         ("GAIN", "gain", None),
-        ("Hi-VAE (Poisson)", "hivae", None),
-        ("Hi-VAE (Gaussian)", "hivae-gaussian", None),
+        ("HI-VAE (Poisson)", "hivae", None),
+        ("HI-VAE (Gaussian)", "hivae-gaussian", None),
         ("scGPT (scratch)", "scgpt_scratch", None),
         ("scGPT (pretrained)", "scgpt_pretrained", None),
         ("xTrimoGene", "xtrimogene", None),
@@ -136,18 +136,6 @@ def get(idx, model, ds, mask, drop, nimp):
     return None
 
 
-CITE_LIST = (
-    "Baselines: MAGIC~\\citep{van2018recovering}, scIDPMs~\\citep{zhang2024scidpms}, "
-    "GAIN~\\citep{yoon2018gain}, Hi-VAE~\\citep{nazabal2020handling}, "
-    "scGPT~\\citep{cui2024scgpt}, xTrimoGene~\\citep{gong2023xtrimogene}, "
-    "Forest-Diffusion~\\citep{jolicoeur2024generating}, ReMDM~\\citep{wang2025remaskingdiscretediffusionmodels}, "
-    "Blackout Diffusion~\\citep{santos2023blackout}"
-    "Methods are grouped into three categories: naive baseline (top), scRNAseq/imputation-specific (middle), "
-    "and general generative (bottom). Best performance in each category for each metric is bolded, "
-    "and second best is italicized."
-)
-
-
 def cell(d, key, kind="plain"):
     if not d or key not in d:
         return "--"
@@ -222,36 +210,47 @@ def bcell(d, label, key, tmap):
 
 
 def emit_main_latex(idx):
-    """7-col grouped main table per task."""
+    """7-col grouped main table per task (pointwise | distributional)."""
     out = []
-    titles = {("fetus", "MCAR", "0.5"): "human fetus cell atlas with 50\\% MCAR",
-              ("fetus", "MNAR_low", "0.25"): "human fetus cell atlas with 25\\% low-biased missingness (MNAR)",
-              ("heart", "MCAR", "0.5"): "heart with 50\\% MCAR"}
-    labels = {("fetus", "MCAR", "0.5"): "tab:fetus_mcar",
-              ("fetus", "MNAR_low", "0.25"): "tab: fetus_mnar",
-              ("heart", "MCAR", "0.5"): "tab:heart_mcar"}
+    # (table-env open, table-env close, caption title, middle-category wording, label)
+    cfg = {
+        ("fetus", "MCAR", "0.5"): (
+            "\\begin{table*}[t]\\centering\\footnotesize\\setlength{\\tabcolsep}{4pt}", "\\end{table*}",
+            "human fetus cell atlas with 50\\% MCAR", "imputation/scRNAseq-specific", "tab:fetus_mcar"),
+        ("fetus", "MNAR_low", "0.25"): (
+            "\\begin{table*}[h]\\centering\\footnotesize\\setlength{\\tabcolsep}{4pt}", "\\end{table*}",
+            "human fetus cell atlas with 25\\% low-biased missingness (MNAR)", "imputation/scRNAseq-specific", "tab: fetus_mnar"),
+        ("heart", "MCAR", "0.5"): (
+            "\\begin{table}[H]\\centering\\footnotesize\\setlength{\\tabcolsep}{4pt}", "\\end{table}",
+            "heart with 50\\% MCAR", "scRNAseq/imputation-specific", "tab:heart_mcar"),
+    }
+    cols = ["spearman_corr", "rmse", "raw_bias", "energy_distance", "scfid", "mmd", "swd"]
     for ds, mask, drop in TASKS:
-        out.append("\\begin{table*}[!t]\\centering\\footnotesize\\setlength{\\tabcolsep}{4pt}")
-        out.append(f"\\caption{{Benchmarking on scRNA-seq imputation, {titles[(ds,mask,drop)]}. Mean (standard error). {CITE_LIST}}}")
-        out.append(f"\\label{{{labels[(ds,mask,drop)]}}}")
+        opn, close, title, middle, label = cfg[(ds, mask, drop)]
+        out.append(opn)
+        out.append(
+            f"\\caption{{Benchmarking on scRNA-seq imputation, {title}. Mean (standard error). "
+            f"Methods are grouped into three categories: naive baseline (top), {middle} (middle), "
+            f"and general generative (bottom). Best performance in each category for each metric is "
+            f"bolded, and second best is italicized.}}")
+        out.append(f"\\label{{{label}}}")
         out.append("\\begin{tabular}{l ccc c cccc}")
         out.append("\\toprule")
-        out.append(" & \\multicolumn{3}{c}{\\textbf{Sample-level}} & & \\multicolumn{4}{c}{\\textbf{Distributional}} \\\\")
+        out.append(" & \\multicolumn{3}{c}{\\textbf{Pointwise}} & & \\multicolumn{4}{c}{\\textbf{Distributional}} \\\\")
         out.append("\\cmidrule(lr){2-4}\\cmidrule(lr){6-9}")
         out.append("\\textbf{Method} & Spearman$\\uparrow$ & RMSE$\\downarrow$ & Bias & & ED$\\downarrow$ & log(scFID)$\\downarrow$ & log(MMD)$\\downarrow$ & SWD$\\downarrow$ \\\\")
         out.append("\\midrule")
-        cols = ["spearman_corr", "rmse", "raw_bias", "energy_distance", "scfid", "mmd", "swd"]
         for gi, group in enumerate(GROUPS):
             rows_data = [(lbl, get(idx, m, ds, mask, drop, n)) for lbl, m, n in group]
             bolds = {k: tiers(rows_data, k) for k in cols}
-            for (label, model, nimp), (_, d) in zip(group, rows_data):
-                row = (f"{label} & {bcell(d,label,'spearman_corr',bolds)} & {bcell(d,label,'rmse',bolds)} & "
-                       f"{bcell(d,label,'raw_bias',bolds)} & & {bcell(d,label,'energy_distance',bolds)} & "
-                       f"{bcell(d,label,'scfid',bolds)} & {bcell(d,label,'mmd',bolds)} & {bcell(d,label,'swd',bolds)} \\\\")
+            for (label_row, model, nimp), (_, d) in zip(group, rows_data):
+                row = (f"{label_row} & {bcell(d,label_row,'spearman_corr',bolds)} & {bcell(d,label_row,'rmse',bolds)} & "
+                       f"{bcell(d,label_row,'raw_bias',bolds)} & & {bcell(d,label_row,'energy_distance',bolds)} & "
+                       f"{bcell(d,label_row,'scfid',bolds)} & {bcell(d,label_row,'mmd',bolds)} & {bcell(d,label_row,'swd',bolds)} \\\\")
                 out.append(row)
             if gi < len(GROUPS) - 1:
                 out.append("\\midrule")
-        out.append("\\bottomrule\\end{tabular}\\end{table*}")
+        out.append(f"\\bottomrule\\end{{tabular}}{close}")
         out.append("")
     return "\n".join(out)
 
@@ -259,15 +258,15 @@ def emit_main_latex(idx):
 def emit_appendix_latex(idx):
     """Full-metric appendix table per task (10 metrics, grouped)."""
     out = []
-    titles = {("fetus", "MCAR", "0.5"): "fetus, 50\\% MCAR",
-              ("fetus", "MNAR_low", "0.25"): "fetus, 25\\% MNAR (low-biased)",
-              ("heart", "MCAR", "0.5"): "heart, 50\\% MCAR"}
+    caps = {("fetus", "MCAR", "0.5"): "Full metrics (fetus, 50\\% MCAR).",
+            ("fetus", "MNAR_low", "0.25"): "Full metrics (fetus, 25\\% MNAR (low-biased))",
+            ("heart", "MCAR", "0.5"): "Full metrics (heart, 50\\% MCAR). Mean (standard error)"}
     labels = {("fetus", "MCAR", "0.5"): "tab:fetus_mcar_full",
               ("fetus", "MNAR_low", "0.25"): "tab:fetus_mnar_full",
               ("heart", "MCAR", "0.5"): "tab:heart_mcar_full"}
     for ds, mask, drop in TASKS:
-        out.append("\\begin{table*}[!t]\\centering\\tiny\\setlength{\\tabcolsep}{3pt}")
-        out.append(f"\\caption{{Full metrics ({titles[(ds,mask,drop)]}). Mean (standard error). {CITE_LIST}}}")
+        out.append("\\begin{table*}[!h]\\centering\\tiny\\setlength{\\tabcolsep}{3pt}")
+        out.append(f"\\caption{{{caps[(ds,mask,drop)]}}}")
         out.append(f"\\label{{{labels[(ds,mask,drop)]}}}")
         out.append("\\begin{tabular}{l cccccc c cccc}")
         out.append("\\toprule")
