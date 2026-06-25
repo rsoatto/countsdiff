@@ -10,8 +10,8 @@ DATA_DIR="${SCRIPT_DIR}/../data"
 ZENODO_RECORD_ID="REPLACE_WITH_ZENODO_RECORD_ID"
 ARCHIVE="countsdiff_data.tar.gz"
 URL="https://zenodo.org/records/${ZENODO_RECORD_ID}/files/${ARCHIVE}?download=1"
-# Optional integrity check: set to the published sha256 (leave empty to skip).
-SHA256=""
+# Integrity check (sha256 of countsdiff_data.tar.gz built 2026-06-25).
+SHA256="e77fcec6303eb97fdfa95f320c3766d091f8b82f42f94a6969d617cb6cb34711"
 
 if [[ "$ZENODO_RECORD_ID" == REPLACE_* ]]; then
   echo "ERROR: scripts/download_data.sh is not configured yet." >&2
