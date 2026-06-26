@@ -5,9 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${SCRIPT_DIR}/../data"
 
-# Zenodo record for the CountsDiff (ICML 2026) artifact.
-# TODO(maintainer): set these once the Zenodo record has been created and uploaded.
-ZENODO_RECORD_ID="REPLACE_WITH_ZENODO_RECORD_ID"
+# Zenodo record for the CountsDiff (ICML 2026) data artifact (DOI 10.5281/zenodo.20882786).
+ZENODO_RECORD_ID="20882786"
 ARCHIVE="countsdiff_data.tar.gz"
 URL="https://zenodo.org/records/${ZENODO_RECORD_ID}/files/${ARCHIVE}?download=1"
 # Integrity check (sha256 of countsdiff_data.tar.gz built 2026-06-25).
