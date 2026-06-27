@@ -1,0 +1,18 @@
+name: scgpt-baseline
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.2.*
+  - pytorch-cuda=12.1
+  - numpy
+  - pandas
+  - scipy
+  - h5py
+  - pip
+  - pip:
+      # flash-attn is intentionally omitted; the baseline runs with
+      # use_fast_transformer=False and plain PyTorch attention.
+      - scgpt==0.2.4

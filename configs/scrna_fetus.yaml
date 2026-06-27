@@ -60,3 +60,8 @@ training:
 scheduler:
   scheduler: "cosine"
   continuous: True
+
+# Weights & Biases logging (optional); entity/project are set in
+# countsdiff/utils/tracking.py. Set enabled: true to log training runs.
+wandb:
+  enabled: false

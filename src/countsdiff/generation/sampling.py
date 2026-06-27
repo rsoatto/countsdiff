@@ -187,7 +187,6 @@ def resolve_sigma_schedule(
         return torch.tensor([float(remasking_prob) for _ in range(T)]).to(device)
 
 
-# Import positional_encoding from SNP_training (matching notebook)
 def positional_encoding(pos, dim=4):
     """Simple sinusoidal positional encoding."""
     pe = torch.zeros(*(pos.shape[:-1]), dim).to(pos.device)
@@ -195,7 +194,6 @@ def positional_encoding(pos, dim=4):
     pe[..., 0::2] = torch.sin(pos * div_term)
     pe[..., 1::2] = torch.cos(pos * div_term)
     return pe
-
 
 def create_model_input(state, true_pos, ancestry, encoding_dim):
     """Create model input exactly like in the notebook"""
@@ -349,7 +347,7 @@ def generate_samples(
                 output = model(model_input, time_tensor, valid_mask=valid_mask, xt=state)
                 predicted_diff_guided = output
 
-            if trainer.dataset_type in ('cifar10','celeba'):
+            if trainer.dataset_type in ('cifar10','celeba') and not poisson_sampling:
                 predicted_diff_guided = predicted_diff_guided.clamp(min=torch.zeros_like(state), max=255.-state)
                 
             if random_rounding:
@@ -359,10 +357,11 @@ def generate_samples(
             else:
                 predicted_diff_guided = predicted_diff_guided.round().squeeze(-1)
                 
-            if predicted_diff_guided.min() < 0:
-                import pdb; pdb.set_trace()
 
             state = backward_step_with_remasking(state, predicted_diff_guided, s, t, sigma_schedule[i], p_scheduler=trainer.p_scheduler, device=device, poisson_approximation=poisson_sampling)
+            
+            if trainer.dataset_type in ('cifar10','celeba') and poisson_sampling:
+                state = state.clamp(min=0, max=255)
             
             if valid_mask is not None:
                 state = state * valid_mask.float()
@@ -423,8 +422,6 @@ def generate_samples_jump(
             x0_pred = x0_pred.clamp(min=torch.zeros_like(state))
             
             rate = trainer.scheduler_config['lbd'] * (p_s - p_t) * x0_pred
-            if rate.min() < 0:
-                import pdb; pdb.set_trace()
             diff = torch.poisson(rate)
 
             state = state + diff
@@ -495,19 +492,34 @@ def impute_data(
 
                     if trainer.conditional_training:
                         full_uncond_mask = torch.ones(model_input.shape[0], dtype=torch.bool, device=model_input.device)
-                        output_unconditional = model(model_input, time_tensor, class_labels=labels, uncond_mask=full_uncond_mask, valid_mask=valid_mask)
-                        predicted_diff_uncond_log = F.softplus(output_unconditional).log()
-                        output_conditional = model(model_input, time_tensor, class_labels=labels, uncond_mask=~full_uncond_mask, valid_mask=valid_mask)
-                        predicted_diff_cond_log = F.softplus(output_conditional).log()
+                        output_unconditional = model(
+                            model_input,
+                            time_tensor,
+                            class_labels=labels,
+                            uncond_mask=full_uncond_mask,
+                            valid_mask=valid_mask,
+                            xt=state,
+                        )
+                        predicted_diff_uncond_log = output_unconditional.log()
+                        output_conditional = model(
+                            model_input,
+                            time_tensor,
+                            class_labels=labels,
+                            uncond_mask=~full_uncond_mask,
+                            valid_mask=valid_mask,
+                            xt=state,
+                        )
+                        predicted_diff_cond_log = output_conditional.log()
                         log_pred = guidance_scale * predicted_diff_cond_log + (1 - guidance_scale) * predicted_diff_uncond_log
                         predicted_diff_guided = log_pred.exp()
                     else:
-                        if guidance_scale not in (0.0, None) and j == 0:
-                            print("Warning: guidance_scale ignored in unconditional model")
-                        if labels not in ([], None) and j == 0:
-                            print("Warning: labels ignored in unconditional model")
-                        output = model(model_input, time_tensor, valid_mask=valid_mask)
-                        predicted_diff_guided = F.softplus(output)
+                        if guidance_scale not in (0.0, None) and j == 0 and it == 0:
+                            if guidance_scale not in (0.0, None):
+                                print("Warning: guidance_scale ignored in unconditional model")
+                            if labels not in ([], None):
+                                print("Warning: labels ignored in unconditional model")
+                        output = model(model_input, time_tensor, valid_mask=valid_mask, xt=state)
+                        predicted_diff_guided = output
 
                     if trainer.dataset_type in ('cifar10', 'celeba'):
                         predicted_diff_guided = predicted_diff_guided.clamp(min=torch.zeros_like(state), max=255. - state)
@@ -542,3 +554,93 @@ def impute_data(
                 print(f"Repaint step {step_group+1}/{num_groups}, max_val: {masked.max().item()}, avg_val: {masked.mean().item()}")
 
     return state
+
+# def impute_data(
+#     model: torch.nn.Module,
+#     initial_state: torch.Tensor,
+#     observation_times: np.ndarray,
+#     original_data: torch.Tensor,
+#     impute_mask: torch.Tensor,
+#     valid_mask: torch.Tensor,
+#     labels: Optional[Union[torch.Tensor, List[torch.Tensor]]],
+#     trainer: CountsdiffTrainer,
+#     guidance_scale: float = 0.0,
+#     remasking_prob: Union[float, Iterable, torch.Tensor] = 0.0,
+#     *,
+#     sigma_method: Optional[str] = None,
+#     sigma_kwargs: Optional[Dict[str, Any]] = None,
+#     sigma_per_token: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+#     random_rounding: bool = True,
+#     device: str = 'cuda',
+#     verbose: bool = False
+# ) -> torch.Tensor:
+#     """
+#     Generate samples with predictor-free guidance 
+#     NOTE: Implemented for images i.e. CIFAR-10
+#     TODO: Extend to SNPs
+#     Args:
+#         model: Trained model
+#         config: Configuration for this level
+#         initial_state: Initial state tensor
+#         positions: Position encodings
+#         valid_mask: Valid position mask
+#         observation_times: Time steps for generation
+#         device: Device to use
+#         guidance_scale: Scale for guidance
+#         remasking_prob: Probability of remasking
+#     Returns:
+#         Generated sample tensor
+#     """
+#     model.eval()
+#     state = initial_state.clone()
+#     # Resolve sigma (remasking) schedule: supports scalar, list, per-token, or method-based
+#     sigma_schedule = resolve_sigma_schedule(
+#         observation_times=observation_times,
+#         p_scheduler=trainer.p_scheduler,
+#         remasking_prob=remasking_prob,
+#         sigma_method=sigma_method,
+#         sigma_kwargs=sigma_kwargs,
+#         sigma_per_token=sigma_per_token,
+#         device=device,
+#     )
+#     with torch.no_grad():
+#         for i, (t, s) in enumerate(zip(observation_times[:-1], observation_times[1:])):
+#             # Normalize state
+#             model_input, time_tensor = prepare_generation_input(trainer, state, t)
+#             # Model prediction
+            
+#             if trainer.conditional_training:
+#                 full_uncond_mask = torch.ones(model_input.shape[0], dtype=torch.bool, device=model_input.device)
+#                 output_unconditional = model(model_input, time_tensor, class_labels=labels,uncond_mask=full_uncond_mask, valid_mask=valid_mask)
+#                 predicted_diff_uncond_log = F.softplus(output_unconditional).log()
+#                 output_conditional = model(model_input, time_tensor, class_labels=labels,uncond_mask=~full_uncond_mask, valid_mask=valid_mask)
+#                 predicted_diff_cond_log = F.softplus(output_conditional).log()
+
+#                 log_predicted_diff_cond = guidance_scale * predicted_diff_cond_log + (1 - guidance_scale) * predicted_diff_uncond_log
+#                 predicted_diff_guided = log_predicted_diff_cond.exp()
+#             else:
+#                 if guidance_scale not in (0.0, None) and i == 0:
+#                     print("Warning: guidance_scale ignored in unconditional model")
+#                 if labels not in ([], None) and i == 0:
+#                     print("Warning: labels ignored in unconditional model")
+#                 output = model(model_input, time_tensor, valid_mask=valid_mask)
+#                 predicted_diff_guided = F.softplus(output)
+
+#             if trainer.dataset_type in ('cifar10','celeba'):
+#                 predicted_diff_guided = predicted_diff_guided.clamp(min=torch.zeros_like(state), max=255.-state)
+                
+#             if random_rounding:
+#                 predicted_diff_guided = _random_round(predicted_diff_guided).squeeze(-1)
+#             else:
+#                 predicted_diff_guided = predicted_diff_guided.round().squeeze(-1)
+
+#             state = backward_step_with_remasking(state, predicted_diff_guided, s, t, sigma_schedule[i], p_scheduler=trainer.p_scheduler, device=device)
+
+#             corrupted_original, _ = trainer.corrupt_data(original_data, torch.tensor(s, device=device))
+#             #Replace known positions with corrupted known positions
+#             state[~(impute_mask.bool())] = corrupted_original[~(impute_mask.bool())]
+
+#             if i % 10 == 0 and verbose:
+#                 print(f"Step {i+1}/{len(observation_times)-1}, max_val: {state.max().item()}, avg_val: {state.mean().item()}")
+
+#     return state

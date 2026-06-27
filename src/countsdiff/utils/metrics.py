@@ -5,7 +5,6 @@ Evaluation metrics for CountsDiff models
 import numpy as np
 import torch
 from scipy import stats
-from sklearn.metrics import pairwise_distances
 from typing import Union, Tuple
 from scipy import linalg
 from torchmetrics import Metric
@@ -13,68 +12,170 @@ import scvi
 import pandas as pd
 import anndata
 import itertools
-from typing import List, Dict, Union
+from typing import List, Dict, Optional, Union
 from scipy.sparse import issparse, spmatrix
 import warnings
 from collections import defaultdict
 
 
-def calculate_mmd(
-    X: Union[np.ndarray, torch.Tensor], 
-    Y: Union[np.ndarray, torch.Tensor],
-    kernel: str = 'rbf',
-    gamma: float = 1.0,
-    u_stat: bool = False
+def _compute_mmd_from_kernel_matrices(
+    XX: np.ndarray,
+    YY: np.ndarray,
+    XY: np.ndarray,
+    u_stat: bool = False,
 ) -> float:
-    """
-    Calculate Maximum Mean Discrepancy (MMD) between two distributions
-    
-    Args:
-        X: First sample set
-        Y: Second sample set  
-        kernel: Kernel type ('rbf', 'linear')
-        gamma: RBF kernel parameter
-        
-    Returns:
-        MMD value
-    """
-    # Convert to numpy if needed
-    if isinstance(X, torch.Tensor):
-        X = X.cpu().numpy()
-    if isinstance(Y, torch.Tensor):
-        Y = Y.cpu().numpy()
-    
-    # Flatten if multidimensional
-    if X.ndim > 2:
-        X = X.reshape(X.shape[0], -1)
-    if Y.ndim > 2:
-        Y = Y.reshape(Y.shape[0], -1)
-    
-    m, n = X.shape[0], Y.shape[0]
-    
-    if kernel == 'rbf':
-        # RBF kernel
-        XX = np.exp(-gamma * pairwise_distances(X, X, squared=True))
-        YY = np.exp(-gamma * pairwise_distances(Y, Y, squared=True))
-        XY = np.exp(-gamma * pairwise_distances(X, Y, squared=True))
-    elif kernel == 'linear':
-        # Linear kernel
-        XX = np.dot(X, X.T)
-        YY = np.dot(Y, Y.T)
-        XY = np.dot(X, Y.T)
-    else:
-        raise ValueError(f"Unknown kernel: {kernel}")
-    
-    # Calculate MMD
+    m, n = XX.shape[0], YY.shape[0]
+
     if u_stat:
         mmd = (XX.sum() - np.diag(XX).sum()) / (m * (m - 1))
         mmd += (YY.sum() - np.diag(YY).sum()) / (n * (n - 1))
     else:
-        mmd = (XX.sum() - np.diag(XX).sum()) / (m * m)
-        mmd += (YY.sum() - np.diag(YY).sum()) / (n * n)
+        mmd = XX.sum() / (m * m)       # include diagonal
+        mmd += YY.sum() / (n * n)      # include diagonal
     mmd -= 2 * XY.sum() / (m * n)
 
-    return np.clip(mmd, min=0)  # MMD should be non-negative
+    return float(mmd)  # MMD should be non-negative
+
+
+def _get_mmd_heuristic_bandwidth(
+    X: Union[np.ndarray, torch.Tensor],
+    eps: float = 1e-8,
+) -> float:
+    if isinstance(X, np.ndarray):
+        X = torch.from_numpy(X)
+
+    if X.ndim > 2:
+        X = X.reshape(X.shape[0], -1)
+
+    half_size = X.shape[0] // 2
+    if half_size == 0:
+        return 1.0
+
+    X_first_half = X[:half_size]
+    X_second_half = X[half_size:2 * half_size]
+    med_sq_dist = torch.median(torch.cdist(X_first_half, X_second_half, p=2) ** 2)
+    return med_sq_dist.item() + eps
+
+
+def _rbf_kernel_block_sums(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    gammas: torch.Tensor,
+    u_stat: bool = False,
+    block_size: int = 2048,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute RBF kernel matrix sums in blocks without materializing full N×N matrices.
+
+    For each gamma, computes sum(K) and (if u_stat) sum(diag(K)) where
+    K_ij = exp(-gamma * ||X_i - Y_j||^2).  Exploits symmetry when X is Y.
+
+    Returns:
+        totals:    [G] float64 tensor of kernel matrix sums
+        diag_sums: [G] float64 tensor of diagonal sums (meaningful only when X is Y)
+    """
+    G = len(gammas)
+    totals = torch.zeros(G, dtype=torch.float64, device=X.device)
+    diag_sums = torch.zeros(G, dtype=torch.float64, device=X.device)
+    symmetric = X is Y
+
+    M, N = X.shape[0], Y.shape[0]
+    for i in range(0, M, block_size):
+        Xi = X[i : i + block_size]
+        j_start = i if symmetric else 0
+        for j in range(j_start, N, block_size):
+            Yj = Y[j : j + block_size]
+            sq_dists = torch.cdist(Xi, Yj).pow_(2)
+
+            is_diag_block = symmetric and (i == j)
+            multiplier = 1.0 if is_diag_block else (2.0 if symmetric else 1.0)
+
+            for g in range(G):
+                K = torch.exp(-gammas[g] * sq_dists)
+                totals[g] += K.sum().to(torch.float64) * multiplier
+                if u_stat and is_diag_block:
+                    diag_sums[g] += K.diag().sum().to(torch.float64)
+
+    return totals, diag_sums
+
+
+def calculate_mmd(
+    X: Union[np.ndarray, torch.Tensor],
+    Y: Union[np.ndarray, torch.Tensor],
+    kernel: str = 'rbf',
+    gamma: Union[float, List[float], Tuple[float, ...], np.ndarray] = 1.0,
+    u_stat: bool = False,
+    block_size: int = 2048,
+) -> float:
+    """
+    Calculate Maximum Mean Discrepancy (MMD) between two distributions.
+
+    Uses block-wise GPU-accelerated kernel evaluation to avoid materializing
+    full N×N matrices (memory O(block_size²) instead of O(N²)).
+
+    Args:
+        X: First sample set
+        Y: Second sample set
+        kernel: Kernel type ('rbf', 'linear')
+        gamma: RBF kernel parameter(s). If multiple values are provided,
+            MMD is computed for each and then averaged.
+        u_stat: Use unbiased U-statistic estimator.
+        block_size: Block size for blocked kernel computation.
+
+    Returns:
+        MMD value
+    """
+    if isinstance(X, np.ndarray):
+        X = torch.from_numpy(X)
+    if isinstance(Y, np.ndarray):
+        Y = torch.from_numpy(Y)
+
+    X = X.float()
+    Y = Y.float()
+
+    if X.ndim > 2:
+        X = X.reshape(X.shape[0], -1)
+    if Y.ndim > 2:
+        Y = Y.reshape(Y.shape[0], -1)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X = X.to(device)
+    Y = Y.to(device)
+
+    gamma_values = np.atleast_1d(np.asarray(gamma, dtype=np.float64))
+    if gamma_values.size == 0:
+        raise ValueError("gamma must contain at least one value")
+    if np.any(gamma_values <= 0):
+        raise ValueError("gamma must be positive")
+
+    if kernel == 'rbf':
+        gammas_t = torch.from_numpy(gamma_values).to(device)
+        m, n = X.shape[0], Y.shape[0]
+
+        xx_sums, xx_diag = _rbf_kernel_block_sums(X, X, gammas_t, u_stat=u_stat, block_size=block_size)
+        yy_sums, yy_diag = _rbf_kernel_block_sums(Y, Y, gammas_t, u_stat=u_stat, block_size=block_size)
+        xy_sums, _ = _rbf_kernel_block_sums(X, Y, gammas_t, u_stat=False, block_size=block_size)
+
+        mmd_values = torch.zeros(len(gammas_t), dtype=torch.float64)
+        for g in range(len(gammas_t)):
+            if u_stat:
+                mmd = (xx_sums[g] - xx_diag[g]) / (m * (m - 1))
+                mmd += (yy_sums[g] - yy_diag[g]) / (n * (n - 1))
+            else:
+                mmd = xx_sums[g] / (m * m)
+                mmd += yy_sums[g] / (n * n)
+            mmd -= 2.0 * xy_sums[g] / (m * n)
+            mmd_values[g] = mmd
+
+        return float(mmd_values.mean())
+
+    elif kernel == 'linear':
+        XX = (X @ X.T).cpu().numpy()
+        YY = (Y @ Y.T).cpu().numpy()
+        XY = (X @ Y.T).cpu().numpy()
+        return _compute_mmd_from_kernel_matrices(XX, YY, XY, u_stat=u_stat)
+
+    else:
+        raise ValueError(f"Unknown kernel: {kernel}")
 
 
 def calculate_jsd(
@@ -158,6 +259,31 @@ def calculate_wasserstein_distance(
     Y = Y.flatten()
     
     return stats.wasserstein_distance(X, Y)
+
+
+def calculate_energy_distance(
+    X: Union[np.ndarray, torch.Tensor],
+    Y: Union[np.ndarray, torch.Tensor]
+) -> float:
+    """
+    Calculate energy distance between two 1D distributions.
+
+    Args:
+        X: First distribution samples
+        Y: Second distribution samples
+
+    Returns:
+        Energy distance
+    """
+    if isinstance(X, torch.Tensor):
+        X = X.detach().cpu().numpy()
+    if isinstance(Y, torch.Tensor):
+        Y = Y.detach().cpu().numpy()
+
+    X = np.asarray(X).flatten()
+    Y = np.asarray(Y).flatten()
+
+    return float(stats.energy_distance(X, Y))
 
 
 def calculate_basic_stats(data: Union[np.ndarray, torch.Tensor]) -> dict:
@@ -287,16 +413,28 @@ class scFID(Metric):
         num_cells = counts.shape[0]
 
         if covariates_data is None:
-            covariates_data = {}
-            covariates_data['batch'] = ['0']*num_cells
-        if 'batch' not in covariates_data.keys():
-            covariates_data['batch'] = ['0']*num_cells
-        
-        obs_df = pd.DataFrame(covariates_data)
+            obs_df = pd.DataFrame(index=np.arange(num_cells))
+        elif isinstance(covariates_data, pd.DataFrame):
+            obs_df = covariates_data.copy()
+        else:
+            obs_df = pd.DataFrame(covariates_data)
+
+        if len(obs_df) != num_cells:
+            raise ValueError(
+                f"Covariates rows ({len(obs_df)}) must match counts rows ({num_cells})."
+            )
+
         for col, all_categories in self.categorical_covariates.items():
-            if col in obs_df:
-                cat_dtype = pd.CategoricalDtype(categories=all_categories)
-                obs_df[col] = obs_df[col].astype(cat_dtype)
+            if not all_categories:
+                continue
+            default_category = all_categories[0]
+            if col not in obs_df.columns:
+                obs_df[col] = [default_category] * num_cells
+            else:
+                obs_df[col] = obs_df[col].fillna(default_category)
+
+            cat_dtype = pd.CategoricalDtype(categories=all_categories)
+            obs_df[col] = obs_df[col].astype(cat_dtype)
         
         adata_batch = anndata.AnnData(X=counts, obs=obs_df, var=self.gene_names)
 
@@ -389,6 +527,39 @@ def r2_per_sample_masked_torch(y: torch.Tensor,
     r2 = r2.masked_fill(invalid, float('nan'))
     return r2
 
+@torch.no_grad()
+def sliced_wasserstein_torch(real: torch.Tensor, gen: torch.Tensor, num_projections=1000) -> float:
+    """
+    Computes Sliced Wasserstein Distance (SWD) to approximate Joint Wasserstein.
+    Projects high-dim data to random 1D lines -> Sorts -> Computes L2 distance.
+    """
+
+    # Check dimensions
+    if real.shape[1] != gen.shape[1]:
+        raise ValueError("Shape mismatch between real and gen data")
+
+    real = real.float()
+    gen = gen.float()
+
+    dim = real.shape[1]
+
+    # 1. Generate random projections (normalized)
+    projections = torch.randn(num_projections, dim, device=real.device)
+    projections = projections / torch.norm(projections, dim=1, keepdim=True)
+    
+    # 2. Project data [N, num_projections]
+    real_proj = real @ projections.T
+    gen_proj = gen @ projections.T
+    
+    # 3. Sort projections (SWD relies on sorting 1D distributions)
+    real_proj_sorted, _ = torch.sort(real_proj, dim=0)
+    gen_proj_sorted, _ = torch.sort(gen_proj, dim=0)
+    
+    # 4. Compute L2 distance averaged over projections
+    diff = real_proj_sorted - gen_proj_sorted
+    wd = torch.mean(torch.pow(diff, 2)) # MSE
+    return torch.sqrt(wd).item()        # RMSE
+
 
 @torch.no_grad()
 def _rankdata_average_torch(x: torch.Tensor) -> torch.Tensor:
@@ -458,24 +629,71 @@ def spearman_per_sample_masked_torch(y: torch.Tensor,
         # Pearson on ranks
         ryc = ry - ry.mean()
         rzc = rz - rz.mean()
-        denom = ryc.norm() * rzc.norm()
-        if denom == 0:
+        ry_norm = ryc.norm()
+        rz_norm = rzc.norm()
+        if ry_norm == 0:
             continue
-        rho[i] = (ryc @ rzc) / denom
+        if rz_norm == 0:
+            rho[i] = 0.0
+            continue
+        rho[i] = (ryc @ rzc) / (ry_norm * rz_norm)
 
     return rho
 
-def _compute_one_pass_eval_metrics(scfid_metric, imputed_data, raw_data, impute_mask, covariates_dict = None):
-    if type(imputed_data) == np.ndarray:
+
+@torch.no_grad()
+def pearson_per_sample_masked_torch(y: torch.Tensor,
+                                    yhat: torch.Tensor,
+                                    mask: torch.Tensor) -> torch.Tensor:
+    """
+    Row-wise Pearson r over masked entries (True = include).
+    y, yhat, mask: [N, D]
+    Returns: [N] Pearson per row, NaN for rows with <2 points or zero variance.
+    """
+    assert y.shape == yhat.shape == mask.shape
+    y = y.float()
+    yhat = yhat.float()
+    mask = mask.bool()
+
+    N, _ = y.shape
+    rho = y.new_full((N,), float('nan'))
+
+    for i in range(N):
+        idx = mask[i]
+        k = int(idx.sum().item())
+        if k < 2:
+            continue
+
+        yi = y[i, idx]
+        zi = yhat[i, idx]
+
+        y_centered = yi - yi.mean()
+        z_centered = zi - zi.mean()
+        denom = y_centered.norm() * z_centered.norm()
+        if denom == 0:
+            continue
+        rho[i] = (y_centered @ z_centered) / denom
+
+    return rho
+
+
+def _compute_one_pass_eval_metrics(
+    scfid_metric: Optional[scFID],
+    imputed_data,
+    raw_data,
+    impute_mask,
+    covariates_dict=None,
+    include_distribution_metrics: bool = True,
+    round_distribution_metrics: bool = False,
+):
+    if isinstance(imputed_data, np.ndarray):
         imputed_data = torch.from_numpy(imputed_data)
-    if type(impute_mask) == np.ndarray:
+    if isinstance(impute_mask, np.ndarray):
         impute_mask = torch.from_numpy(impute_mask)
-    if type(raw_data) == np.ndarray:
+    if isinstance(raw_data, np.ndarray):
         raw_data = torch.from_numpy(raw_data)
-    
     imputed_vals = torch.masked_select(imputed_data, impute_mask)
     actual_vals = torch.masked_select(raw_data, impute_mask)
-
     if imputed_vals.numel() == 0:
         warnings.warn("No values selected by impute_mask in this sample. Returning NaNs.")
         return {
@@ -483,55 +701,91 @@ def _compute_one_pass_eval_metrics(scfid_metric, imputed_data, raw_data, impute_
             "rmse": float("nan"), 
             "mae": float("nan"),
             "raw_bias": float("nan"), 
-            "spearman_corr": float("nan"), 
+            "spearman_corr": float("nan"),
+            "pearson_corr": float("nan"),
+            "energy_distance": float("nan"),
             "scfid": float("nan")
         }
     raw_bias = torch.mean(imputed_vals - actual_vals).item()
     mae = torch.mean(torch.abs(imputed_vals-actual_vals)).item()
     rmse = torch.sqrt(torch.mean((imputed_vals - actual_vals) ** 2)).item()
+    dist_imputed_data = imputed_data
+    dist_imputed_vals = imputed_vals
+    if round_distribution_metrics:
+        dist_imputed_data = torch.round(imputed_data).clamp_min(0)
+        dist_imputed_vals = torch.masked_select(dist_imputed_data, impute_mask)
 
-    r2 = r2_per_sample_masked_torch(imputed_data, raw_data, impute_mask)  # [N]
+    energy_distance = calculate_energy_distance(actual_vals, dist_imputed_vals)
+
+    r2 = r2_per_sample_masked_torch(raw_data, imputed_data, impute_mask)  # [N]
     r2 = torch.nanmean(r2)  # average over samples, ignoring NaNs
 
-
-    if covariates_dict:
+    fake_covars = covariates_dict
+    if covariates_dict is not None:
         n_imputed = imputed_data.shape[0]
-        fake_covars = {}
         if n_imputed != raw_data.shape[0]:
-            for k,v in covariates_dict.items():
-                fake_covars[k] = v[:n_imputed]
-        else:
-            fake_covars = covariates_dict
-    
+            if isinstance(covariates_dict, pd.DataFrame):
+                fake_covars = covariates_dict.iloc[:n_imputed].copy()
+            else:
+                fake_covars = {}
+                for k, v in covariates_dict.items():
+                    fake_covars[k] = v[:n_imputed]
+
+    spearman_corr = imputed_data.new_tensor(float("nan"))
+    pearson_corr = imputed_data.new_tensor(float("nan"))
     if imputed_vals.numel() > 1:
         spearman_corr = spearman_per_sample_masked_torch(imputed_data, raw_data, impute_mask)
         spearman_corr = torch.nanmean(spearman_corr)  # average over samples, ignoring NaNs
-        
-    #calculating mmd heuristic from samples of raw data
-    X_train_first_half = raw_data[:raw_data.shape[0]//2]
-    X_train_second_half = raw_data[raw_data.shape[0]//2:2*raw_data.shape[0]//2]
-    dists = torch.cdist(X_train_first_half, X_train_second_half, p=2)**2
-    med_sq_dist = torch.median(dists)
-    gamma = 1.0 / (2 * med_sq_dist.item() + 1e-8)
-    print(f"Using gamma={gamma} for MMD RBF kernel")
-    mmd = calculate_mmd(raw_data.numpy(), imputed_data.numpy(), gamma=gamma).item()
+        pearson_corr = pearson_per_sample_masked_torch(imputed_data, raw_data, impute_mask)
+        pearson_corr = torch.nanmean(pearson_corr)  # average over samples, ignoring NaNs
 
-    scfid_metric.update(raw_data.numpy(), covariates_dict, True)
-    scfid_metric.update(imputed_data.numpy(), fake_covars, False)
-    scfid = scfid_metric.compute().item()
-    scfid_metric.reset()
+    raw_data_np = raw_data.detach().cpu().numpy()
+    imputed_data_np = dist_imputed_data.detach().cpu().numpy()
+
+    mmd = float("nan")
+    swd = float("nan")
+    if include_distribution_metrics:
+        base_bandwidth = _get_mmd_heuristic_bandwidth(raw_data)
+        bandwidth_scales = np.array([0.25, 0.5, 1.0, 2.0, 4.0], dtype=np.float64)
+        bandwidths = base_bandwidth * bandwidth_scales
+        gammas = 1.0 / (2.0 * bandwidths)
+        print(
+            "Using MMD base bandwidth="
+            f"{base_bandwidth} and averaging over bandwidths={bandwidths.tolist()}"
+        )
+        mmd = calculate_mmd(raw_data_np, imputed_data_np, gamma=gammas)
+        swd = sliced_wasserstein_torch(raw_data, dist_imputed_data)
+
+    scfid = float("nan")
+    if scfid_metric is not None:
+        scfid_metric.update(raw_data_np, covariates_dict, True)
+        scfid_metric.update(imputed_data_np, fake_covars, False)
+        scfid = scfid_metric.compute().item()
+        scfid_metric.reset()
     results = {
-        "r2": r2.numpy().tolist(),
+        "r2": r2.detach().cpu().item(),
         "rmse": rmse,
         "mae": mae,
         "raw_bias": raw_bias,
-        "spearman_corr": spearman_corr.numpy().tolist(),
+        "spearman_corr": spearman_corr.detach().cpu().item(),
+        "pearson_corr": pearson_corr.detach().cpu().item(),
+        "energy_distance": energy_distance,
         "scfid": scfid,
-        'mmd': mmd
+        'mmd': mmd,
+        'swd': swd
     }
     return results
 
-def compute_resampled_eval(scfid_metric, imputed_data, raw_data, impute_mask, covariates_dict=None, n_samples=50000, n_resamples=10):
+def compute_resampled_eval(
+    scfid_metric,
+    imputed_data,
+    raw_data,
+    impute_mask,
+    covariates_dict=None,
+    n_samples=50000,
+    n_resamples=10,
+    round_distribution_metrics: bool = False,
+):
     total_size = raw_data.shape[0]
     if n_samples > total_size:
         raise ValueError(f"n_samples ({n_samples}) cannot be larger than the total dataset size ({total_size}).")
@@ -541,7 +795,6 @@ def compute_resampled_eval(scfid_metric, imputed_data, raw_data, impute_mask, co
     print(f"starting resampling eval: {n_resamples} iterations of {n_samples} samples...")
     for i in range(n_resamples):
         sample_indices = torch.randint(0, total_size, (n_samples, ), device = 'cpu')
-
         imputed_subset = imputed_data[sample_indices]
         raw_subset = raw_data[sample_indices]
         mask_subset = impute_mask[sample_indices]
@@ -551,7 +804,12 @@ def compute_resampled_eval(scfid_metric, imputed_data, raw_data, impute_mask, co
             covariates_subset = {key: np.array(val)[sample_indices.numpy()].tolist() for key, val in covariates_dict.items()}
 
         single_run_metrics = _compute_one_pass_eval_metrics(
-            scfid_metric, imputed_subset, raw_subset, mask_subset, covariates_subset
+            scfid_metric,
+            imputed_subset,
+            raw_subset,
+            mask_subset,
+            covariates_subset,
+            round_distribution_metrics=round_distribution_metrics,
         )
 
         for key, value in single_run_metrics.items():

@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 import h5py
 import argparse
 from sklearn.model_selection import train_test_split
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import scipy.sparse as sp
 
 class SingleCellProcessor:
@@ -207,22 +207,31 @@ class SingleCellDataset(Dataset):
     """
     Custom PyTorch Dataset class for scRNA data.
     """
-    def __init__(self, data_source: str, split: str = 'train', condition_keys: list[str] = None, return_strings_for: list[str] = None):
+    def __init__(
+        self,
+        data_source: str,
+        split: str = 'train',
+        condition_keys: list[str] = None,
+        return_strings_for: list[str] = None,
+        return_labels: Optional[bool] = None,
+    ):
         """
         Args:
             data_source (str): Path to the .h5 or .hdf5 file containing preprocesed data.
             split (str): which data split for the dataset (train/val/test).
             condition_keys (list[str], optional): List of condition keys to load from .obs (e.g. ["cell_type, "batch"]).
             return_strings_for (list[str], optional): List of condition keys to return string instead of category code. 
+            return_labels (bool, optional): Whether __getitem__ should include label tensors in the batch.
             """
         super().__init__()
         print(f"\n--- Initializing Dataset for {split} split ---")
         self.split = split
-        self.condition_keys = (
-            condition_keys if condition_keys is not None else ["cell_type", "batch"]
-        )
-        self.return_strings_for = (
-            return_strings_for if return_strings_for is not None else []
+        requested_condition_keys = condition_keys if condition_keys is not None else ["cell_type", "batch"]
+        self.requested_condition_keys = [key.lower() for key in requested_condition_keys]
+        self.condition_keys = []
+        self.return_strings_for = [key.lower() for key in (return_strings_for or [])]
+        self.return_labels = (
+            bool(self.requested_condition_keys) if return_labels is None else bool(return_labels)
         )
 
         self.gene_names = None
@@ -251,7 +260,8 @@ class SingleCellDataset(Dataset):
             )
             self.gene_names = [name.decode('utf-8') for name in f['gene_names'][:]]
 
-            for key in self.condition_keys:
+            loaded_condition_keys = []
+            for key in self.requested_condition_keys:
                 key = key.lower()
                 value_key = f"{key}_values"
                 if value_key not in split_group:
@@ -266,27 +276,30 @@ class SingleCellDataset(Dataset):
                     self, f"{key}_values", np.array(string_values)
                 )
                 setattr(self, f"{key}_mapping", dict(enumerate(cats.categories)))
+                loaded_condition_keys.append(key)
+
+            self.condition_keys = loaded_condition_keys
 
     def __len__(self):
         return self.counts.shape[0]
 
     def __getitem__(self, idx):
-        items = []
-        for key in self.condition_keys:
-            code = getattr(self, f"{key}_labels")[idx].item()
-            if key in self.return_strings_for:
-                string_val = getattr(self, f"{key}_mapping")[code]
-                items.append(string_val)
-            else:
-                items.append(torch.tensor(code, dtype=torch.long))
+        items = [self.counts[idx]]
+        if self.return_labels:
+            label_items = []
+            for key in self.condition_keys:
+                code = getattr(self, f"{key}_labels")[idx].item()
+                if key in self.return_strings_for:
+                    string_val = getattr(self, f"{key}_mapping")[code]
+                    label_items.append(string_val)
+                else:
+                    label_items.append(torch.tensor(code, dtype=torch.long))
+            items.append(label_items)
+
+        items.append(self.missingness_mask[idx])
         if hasattr(self, "target_mask"):
-            return tuple(
-                [self.counts[idx], items, self.missingness_mask[idx], self.target_mask[idx]] 
-            )
-        else:
-            return tuple(
-                [self.counts[idx], items, self.missingness_mask[idx]] 
-            )
+            items.append(self.target_mask[idx])
+        return tuple(items)
         
     def get_num_classes(self, key):
         """
@@ -306,6 +319,9 @@ class SingleCellDataset(Dataset):
             pd.DataFrame: A DataFrame where each column corresponds to a condition_key
                           and each row corresponds to a cell.
         """
+        if not self.condition_keys:
+            return pd.DataFrame(index=np.arange(len(self)))
+
         conditions_data = {}
         for key in self.condition_keys:
             key = key.lower()
@@ -325,15 +341,35 @@ class SingleCellDataset(Dataset):
         """
         Builds a dictionary of named covariates from a list of numerical labels
         """
+        if labels is None or not self.condition_keys:
+            return {}
+
+        if isinstance(labels, dict):
+            label_list = [labels[key] for key in self.condition_keys]
+        elif isinstance(labels, (list, tuple)):
+            label_list = list(labels)
+        else:
+            label_list = [labels]
+
+        if len(label_list) != len(self.condition_keys):
+            raise ValueError(
+                f"Expected {len(self.condition_keys)} label arrays for keys {self.condition_keys}, "
+                f"got {len(label_list)}."
+            )
+
         output = {}
         for i, key in enumerate(self.condition_keys):
-            codes = labels[i]
-            if isinstance(codes, torch.Tensor) or isinstance(codes, np.ndarray):
+            codes = label_list[i]
+            if isinstance(codes, torch.Tensor):
+                codes = codes.detach().cpu().tolist()
+            elif isinstance(codes, np.ndarray):
                 codes = codes.tolist()
+            elif not isinstance(codes, list):
+                codes = [codes]
             mapping = getattr(self, f"{key}_mapping", None)
             if mapping is None:
                 raise ValueError(f"No mapping found for key '{key}'")
-            output[key] = [mapping[code] for code in codes]
+            output[key] = [mapping[int(code)] for code in codes]
         return output
     
     def build_covariate_df(self, labels):
@@ -341,6 +377,8 @@ class SingleCellDataset(Dataset):
         Builds a pandas DataFrame of named covariates from a list of numerical labels
         """
         covariate_dict = self.build_covariate_dict(labels)
+        if not covariate_dict:
+            return None
         return pd.DataFrame(covariate_dict)
     
     def get_obs_dict(self, unique: bool = False) -> Dict[str, List[Any]]:

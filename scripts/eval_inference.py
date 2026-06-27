@@ -6,7 +6,7 @@ Sweeps over:
 - guidance scale
 - remasking schedules (constant, max, max_capped, rescaled)
 
-Requires a trained run (Neptune run_id) so CountsdiffGenerator can load the model and data.
+Requires a trained run identifier so CountsdiffGenerator can load the model and data.
 """
 
 import argparse
@@ -76,7 +76,7 @@ def parse_list(arg: Optional[str], typ=float) -> Optional[List[Any]]:
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate inference hyperparameters for blackout diffusion (CIFAR-10)")
-    parser.add_argument('--run-id', required=True, help='Neptune run ID to load model and config')
+    parser.add_argument('--run-id', required=True, help='Legacy Neptune ID or W&B run ID to load model and config')
     parser.add_argument('--checkpoint', required=False, help='Run checkpoint')
     parser.add_argument('--device', default='cuda', help='Device to use (cuda/cpu)')
     parser.add_argument('--num-samples', type=int, default=5000, help='Number of samples to generate per setting')

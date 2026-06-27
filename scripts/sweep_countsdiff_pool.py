@@ -20,6 +20,7 @@ import os
 import sys
 import logging
 import warnings
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm.auto import tqdm
 from queue import Empty
@@ -27,10 +28,9 @@ from queue import Empty
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from scipy import linalg
 
 from countsdiff.generation.generator import CountsdiffImputer
-from countsdiff.utils.metrics import scFID
+from countsdiff.utils.metrics import _compute_one_pass_eval_metrics, scFID
 
 
 
@@ -114,21 +114,53 @@ def build_tasks(
     eta_rescales: List[float],
     repaint_num_iters: Optional[int] = None,
     repaint_jumps: Optional[int] = None,
+    checkpoint: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     tasks: List[Dict[str, Any]] = []
     for n_steps, guidance, repaint_num_iters, repaint_jumps in itertools.product(steps_list, guidance_list, repaint_num_iters, repaint_jumps):
         for method in methods:
             if method == 'none':
                 for remask in remask_list:
-                    tasks.append({'n_steps': n_steps, 'guidance_scale': guidance, 'sigma_method': 'none', 'remasking_prob': remask, 'repaint_num_iters': repaint_num_iters, 'repaint_jumps': repaint_jumps})
+                    tasks.append({
+                        'n_steps': n_steps,
+                        'guidance_scale': guidance,
+                        'sigma_method': 'none',
+                        'remasking_prob': remask,
+                        'repaint_num_iters': repaint_num_iters,
+                        'repaint_jumps': repaint_jumps,
+                        'checkpoint': checkpoint,
+                    })
             elif method == 'max':
-                tasks.append({'n_steps': n_steps, 'guidance_scale': guidance, 'sigma_method': 'max', 'repaint_num_iters': repaint_num_iters, 'repaint_jumps': repaint_jumps})
+                tasks.append({
+                    'n_steps': n_steps,
+                    'guidance_scale': guidance,
+                    'sigma_method': 'max',
+                    'repaint_num_iters': repaint_num_iters,
+                    'repaint_jumps': repaint_jumps,
+                    'checkpoint': checkpoint,
+                })
             elif method == 'max_capped':
                 for cap in eta_caps:
-                    tasks.append({'n_steps': n_steps, 'guidance_scale': guidance, 'sigma_method': 'max_capped', 'eta_cap': cap, 'repaint_num_iters': repaint_num_iters, 'repaint_jumps': repaint_jumps})
+                    tasks.append({
+                        'n_steps': n_steps,
+                        'guidance_scale': guidance,
+                        'sigma_method': 'max_capped',
+                        'eta_cap': cap,
+                        'repaint_num_iters': repaint_num_iters,
+                        'repaint_jumps': repaint_jumps,
+                        'checkpoint': checkpoint,
+                    })
             elif method == 'rescaled':
                 for scale in eta_rescales:
-                    tasks.append({'n_steps': n_steps, 'guidance_scale': guidance, 'sigma_method': 'rescaled', 'eta_rescale': scale, 'repaint_num_iters': repaint_num_iters, 'repaint_jumps': repaint_jumps})
+                    tasks.append({
+                        'n_steps': n_steps,
+                        'guidance_scale': guidance,
+                        'sigma_method': 'rescaled',
+                        'eta_rescale': scale,
+                        'repaint_num_iters': repaint_num_iters,
+                        'repaint_jumps': repaint_jumps,
+                        'checkpoint': checkpoint,
+                    })
             else:
                 raise ValueError(f"Unknown sigma method: {method}")
     return tasks
@@ -136,6 +168,8 @@ def build_tasks(
 
 def base_name_for(spec: Dict[str, Any]) -> str:
     tokens = [f"steps{spec['n_steps']}", f"guid{fmt_val(spec['guidance_scale'])}", f"repaint{spec['repaint_num_iters']}j{spec['repaint_jumps']}"]
+    if spec.get('checkpoint') is not None:
+        tokens.append(f"ckpt{int(spec['checkpoint'])}")
     if spec['sigma_method'] == 'none':
         tokens += ["none", f"remask{fmt_val(spec['remasking_prob'])}"]
     elif spec['sigma_method'] == 'max':
@@ -156,8 +190,28 @@ def shard_sizes(total: int, num_parts: int) -> List[int]:
 def shard_metrics_path(shards_output_path: str, base_name: str, part_idx: int) -> str:
     return os.path.join(shards_output_path, base_name, f"part_{part_idx:03d}_metrics.npz")
 
-def shard_samples_path(shards_output_path: str, base_name: str, part_idx: int) -> str:
-    return os.path.join(shards_output_path, base_name, f"part_{part_idx:03d}.npz")
+def shard_samples_path(
+    shards_output_path: str,
+    base_name: str,
+    part_idx: int,
+    repeat_idx: Optional[int] = None,
+) -> str:
+    if repeat_idx is None:
+        return os.path.join(shards_output_path, base_name, f"part_{part_idx:03d}.npz")
+    return os.path.join(
+        shards_output_path,
+        base_name,
+        f"repeat_{repeat_idx:03d}",
+        f"part_{part_idx:03d}.npz",
+    )
+
+
+def repeat_result_path(results_dir: str, base_name: str, repeat_idx: int) -> str:
+    return os.path.join(results_dir, "_repeats", base_name, f"repeat_{repeat_idx:03d}.json")
+
+
+def aggregated_result_path(results_dir: str, base_name: str) -> str:
+    return os.path.join(results_dir, f"{base_name}.json")
 
 
 def set_seed_all(seed: int) -> None:
@@ -171,25 +225,184 @@ def set_seed_all(seed: int) -> None:
     random.seed(seed)
 
 
-def compute_rmse_r2(imputed: torch.Tensor, ground_truth: torch.Tensor, impute_mask: torch.Tensor) -> Tuple[float, float]:
-    imputed_vals = torch.masked_select(imputed, impute_mask.bool())
-    actual_vals = torch.masked_select(ground_truth, impute_mask.bool())
-    rmse = torch.sqrt(torch.mean((imputed_vals - actual_vals) ** 2)).item()
-    ss_res = torch.sum((actual_vals - imputed_vals) ** 2)
-    ss_tot = torch.sum((actual_vals - torch.mean(actual_vals)) ** 2)
-    # Handle degenerate case gracefully
-    r2 = float(1.0 - (ss_res / (ss_tot + 1e-12)).item())
-    return float(rmse), r2
+def stable_name_seed_offset(name: str) -> int:
+    return int(zlib.adler32(name.encode('utf-8')) % 10_000_000)
 
-def fid_from_latents(real_feats: np.ndarray, fake_feats: np.ndarray) -> float:
-    mu_real, sigma_real = real_feats.mean(axis=0), np.cov(real_feats, rowvar=False)
-    mu_fake, sigma_fake = fake_feats.mean(axis=0), np.cov(fake_feats, rowvar=False)
-    sum_sq_diff = float(np.sum((mu_real - mu_fake) ** 2.0))
-    covmean, _ = linalg.sqrtm(sigma_real.dot(sigma_fake), disp=False)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    fid = sum_sq_diff + float(np.trace(sigma_real + sigma_fake - 2.0 * covmean))
-    return float(fid)
+
+def configure_imputer_for_spec(
+    imputer: CountsdiffImputer,
+    spec: Dict[str, Any],
+    *,
+    batch_size: int,
+    device_str: str,
+) -> Tuple[str, int, float]:
+    method = spec['sigma_method']
+    n_steps = int(spec['n_steps'])
+    guidance = float(spec['guidance_scale'])
+    repaint_num_iters = spec.get('repaint_num_iters')
+    repaint_jump = spec.get('repaint_jumps')
+    common_kwargs = {
+        'n_steps': n_steps,
+        'device': device_str,
+        'guidance_scale': guidance,
+        'batch_size': batch_size,
+        'repaint_num_iters': int(repaint_num_iters) if repaint_num_iters is not None else None,
+        'repaint_jump': int(repaint_jump) if repaint_jump is not None else None,
+    }
+
+    if method == 'none':
+        imputer.update_hyperparameters(
+            remasking_prob=float(spec['remasking_prob']),
+            sigma_kwargs=None,
+            **common_kwargs,
+        )
+        # CountsdiffImputer.update_hyperparameters uses None as "leave unchanged",
+        # so clear sigma-related fields explicitly for the pure remasking path.
+        imputer.sigma_method = None
+        imputer.sigma_kwargs = None
+    elif method == 'max':
+        imputer.update_hyperparameters(
+            remasking_prob=0.0,
+            sigma_method='max',
+            sigma_kwargs={},
+            **common_kwargs,
+        )
+    elif method == 'max_capped':
+        cap = float(spec['eta_cap'])
+        imputer.update_hyperparameters(
+            remasking_prob=0.0,
+            sigma_method='max_capped',
+            sigma_kwargs={'eta_cap': cap},
+            **common_kwargs,
+        )
+    elif method == 'rescaled':
+        scale = float(spec['eta_rescale'])
+        imputer.update_hyperparameters(
+            remasking_prob=0.0,
+            sigma_method='rescaled',
+            sigma_kwargs={'eta_rescale': scale},
+            **common_kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown sigma method: {method}")
+
+    return method, n_steps, guidance
+
+
+def build_result_metadata(spec: Dict[str, Any], dropout_ratio: float) -> Dict[str, Any]:
+    res: Dict[str, Any] = {
+        'n_steps': int(spec['n_steps']),
+        'guidance_scale': float(spec['guidance_scale']),
+        'sigma_method': spec['sigma_method'],
+        'dropout_ratio': float(dropout_ratio),
+    }
+    if spec.get('checkpoint') is not None:
+        res['checkpoint'] = int(spec['checkpoint'])
+    if spec['sigma_method'] == 'none':
+        res['remasking_prob'] = float(spec['remasking_prob'])
+    elif spec['sigma_method'] == 'max_capped':
+        res['eta_cap'] = float(spec['eta_cap'])
+    elif spec['sigma_method'] == 'rescaled':
+        res['eta_rescale'] = float(spec['eta_rescale'])
+    if spec.get('repaint_num_iters') is not None:
+        res['repaint_num_iters'] = int(spec['repaint_num_iters'])
+    if spec.get('repaint_jumps') is not None:
+        res['repaint_jump'] = int(spec['repaint_jumps'])
+    return res
+
+
+RESULT_METADATA_KEYS = {
+    'checkpoint',
+    'n_steps',
+    'guidance_scale',
+    'sigma_method',
+    'dropout_ratio',
+    'remasking_prob',
+    'eta_cap',
+    'eta_rescale',
+    'repaint_num_iters',
+    'repaint_jump',
+    'num_repeats',
+}
+
+
+def summarize_repeat_metric(values: List[float]) -> Tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float("nan"), float("nan")
+    mean = float(np.mean(finite))
+    if finite.size <= 1:
+        return mean, 0.0
+    stderr = float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+    return mean, stderr
+
+
+def aggregate_repeat_metrics(
+    spec: Dict[str, Any],
+    *,
+    dropout_ratio: float,
+    repeat_results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    aggregated = build_result_metadata(spec, dropout_ratio)
+    aggregated['num_repeats'] = len(repeat_results)
+
+    metric_keys: List[str] = []
+    seen = set()
+    for result in repeat_results:
+        for key, value in result.items():
+            if key in RESULT_METADATA_KEYS or key.endswith('_se') or key.startswith('_'):
+                continue
+            if isinstance(value, (int, float, np.integer, np.floating)) and key not in seen:
+                seen.add(key)
+                metric_keys.append(key)
+
+    for key in metric_keys:
+        mean, stderr = summarize_repeat_metric(
+            [float(result.get(key, float("nan"))) for result in repeat_results]
+        )
+        aggregated[key] = mean
+        aggregated[f"{key}_se"] = stderr
+
+    return aggregated
+
+
+def task_label(base_name: str, repeat_idx: int, num_repeats: int) -> str:
+    if num_repeats <= 1:
+        return base_name
+    return f"{base_name} repeat{repeat_idx:03d}"
+
+
+def save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def summarize_eval_metrics(
+    *,
+    imputed,
+    raw_data,
+    impute_mask,
+    covariates,
+    scfid_metric: Optional[scFID],
+    device_str: str,
+) -> Dict[str, float]:
+    metric = None
+    if scfid_metric is not None:
+        metric = scfid_metric.to(device_str).eval()
+        metric.reset()
+
+    metrics = _compute_one_pass_eval_metrics(
+        metric,
+        imputed,
+        raw_data,
+        impute_mask,
+        covariates_dict=covariates,
+    )
+    return {key: float(value) for key, value in metrics.items()}
 
 
 def run_one_task_impute(
@@ -207,51 +420,12 @@ def run_one_task_impute(
 
     Returns a dict with metrics and the spec fields used.
     """
-    method = spec['sigma_method']
-    n_steps = int(spec['n_steps'])
-    guidance = float(spec['guidance_scale'])
-
-    # Update imputer hyperparameters for this spec
-    if method == 'none':
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method=None,
-            sigma_kwargs=None,
-            batch_size=batch_size,
-        )
-    elif method == 'max':
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='max',
-            sigma_kwargs={},
-            batch_size=batch_size,
-        )
-    elif method == 'max_capped':
-        cap = float(spec['eta_cap'])
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='max_capped',
-            sigma_kwargs={'eta_cap': cap},
-            batch_size=batch_size,
-        )
-    elif method == 'rescaled':
-        scale = float(spec['eta_rescale'])
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='rescaled',
-            sigma_kwargs={'eta_rescale': scale},
-            batch_size=batch_size,
-        )
-    else:
-        raise ValueError(f"Unknown sigma method: {method}")
+    configure_imputer_for_spec(
+        imputer,
+        spec,
+        batch_size=batch_size,
+        device_str=device_str,
+    )
 
     # Build one batch from val dataset
     val_ds = trainer.val_loader.dataset
@@ -285,37 +459,18 @@ def run_one_task_impute(
     # Restore known entries
     imputed[~impute_mask] = counts[~impute_mask]
 
-    # Metrics
-    rmse, r2 = compute_rmse_r2(imputed, counts, impute_mask)
+    cov_df = val_ds.build_covariate_df(labels)
+    eval_metrics = summarize_eval_metrics(
+        imputed=imputed,
+        raw_data=counts,
+        impute_mask=impute_mask,
+        covariates=cov_df,
+        scfid_metric=scfid_metric,
+        device_str=str(imputer.device),
+    )
 
-    # scFID using trainer's metric (already initialized for scrna)
-    scfid_value = None
-    if scfid_metric is not None:
-        scfid_metric = scfid_metric.to(imputer.device).eval()
-        scfid_metric.reset()
-        cov_df = val_ds.build_covariate_df(labels)
-        scfid_metric.update(counts.cpu().numpy(), cov_df, True)
-        scfid_metric.update(imputed.detach().cpu().numpy(), cov_df, False)
-        scfid_value = float(scfid_metric.compute().item())
-        scfid_metric.reset()
-
-    res: Dict[str, Any] = {
-        'n_steps': n_steps,
-        'guidance_scale': guidance,
-        'sigma_method': method,
-        'dropout_ratio': float(dropout_ratio),
-        'rmse': float(rmse),
-        'r2': float(r2),
-    }
-    if scfid_value is not None:
-        res['scfid'] = float(scfid_value)
-
-    if method == 'none':
-        res['remasking_prob'] = float(spec['remasking_prob'])
-    elif method == 'max_capped':
-        res['eta_cap'] = float(spec['eta_cap'])
-    elif method == 'rescaled':
-        res['eta_rescale'] = float(spec['eta_rescale'])
+    res = build_result_metadata(spec, dropout_ratio)
+    res.update(eval_metrics)
 
     return res
 
@@ -337,51 +492,12 @@ def compute_imputation_shard(
       - sse, n_imputed, sum_actual, sum_actual2
       - real_latents, fake_latents (np arrays) if scfid_metric provided
     """
-    method = spec['sigma_method']
-    n_steps = int(spec['n_steps'])
-    guidance = float(spec['guidance_scale'])
-
-    # Update hyperparameters
-    if method == 'none':
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method=None,
-            sigma_kwargs=None,
-            batch_size=batch_size,
-        )
-    elif method == 'max':
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='max',
-            sigma_kwargs={},
-            batch_size=batch_size,
-        )
-    elif method == 'max_capped':
-        cap = float(spec['eta_cap'])
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='max_capped',
-            sigma_kwargs={'eta_cap': cap},
-            batch_size=batch_size,
-        )
-    elif method == 'rescaled':
-        scale = float(spec['eta_rescale'])
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='rescaled',
-            sigma_kwargs={'eta_rescale': scale},
-            batch_size=batch_size,
-        )
-    else:
-        raise ValueError(f"Unknown sigma method: {method}")
+    configure_imputer_for_spec(
+        imputer,
+        spec,
+        batch_size=batch_size,
+        device_str=device_str,
+    )
 
     val_ds = trainer.val_loader.dataset
     num_cells = min(num_cells, len(val_ds))
@@ -455,51 +571,12 @@ def compute_imputation_shard_samples(
       - impute_mask: np.ndarray [cells x genes] bool, True where imputed
       - labels_list: List[np.ndarray] length = num_condition_keys, each [cells]
     """
-    method = spec['sigma_method']
-    n_steps = int(spec['n_steps'])
-    guidance = float(spec['guidance_scale'])
-
-    # Update hyperparameters for this spec
-    if method == 'none':
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method=None,
-            sigma_kwargs=None,
-            batch_size=batch_size,
-        )
-    elif method == 'max':
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='max',
-            sigma_kwargs={},
-            batch_size=batch_size,
-        )
-    elif method == 'max_capped':
-        cap = float(spec['eta_cap'])
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='max_capped',
-            sigma_kwargs={'eta_cap': cap},
-            batch_size=batch_size,
-        )
-    elif method == 'rescaled':
-        scale = float(spec['eta_rescale'])
-        imputer.update_hyperparameters(
-            n_steps=n_steps,
-            device=device_str,
-            guidance_scale=guidance,
-            sigma_method='rescaled',
-            sigma_kwargs={'eta_rescale': scale},
-            batch_size=batch_size,
-        )
-    else:
-        raise ValueError(f"Unknown sigma method: {method}")
+    configure_imputer_for_spec(
+        imputer,
+        spec,
+        batch_size=batch_size,
+        device_str=device_str,
+    )
 
     val_ds = trainer.val_loader.dataset
     num_cells = min(num_cells, len(val_ds))
@@ -577,11 +654,18 @@ def worker(device_idx: int, device_str: str, task_queue: mp.Queue, progress_queu
             break
 
         base_name = base_name_for(spec)
+        repeat_idx = int(spec.get('_repeat_idx', 0))
+        task_name = task_label(base_name, repeat_idx, args.num_repeats)
+        final_result_path = aggregated_result_path(results_dir, base_name)
         is_shard = ('_nparts' in spec and spec['_nparts'] is not None)
         if not is_shard:
-            result_path = os.path.join(results_dir, f"{base_name}.json")
-            if args.resume and os.path.exists(result_path):
-                progress_queue.put(("skip", device_str, base_name))
+            repeat_path = repeat_result_path(results_dir, base_name, repeat_idx)
+            if args.resume and os.path.exists(final_result_path):
+                progress_queue.put(("skip", device_str, task_name))
+                task_queue.task_done()
+                continue
+            if args.resume and os.path.exists(repeat_path):
+                progress_queue.put(("skip", device_str, task_name))
                 task_queue.task_done()
                 continue
         else:
@@ -589,15 +673,24 @@ def worker(device_idx: int, device_str: str, task_queue: mp.Queue, progress_queu
             nparts = int(spec['_nparts'])
             sizes = shard_sizes(args.num_samples, nparts)
             want = sizes[part_idx]
-            shard_path = shard_samples_path(shards_output_path, base_name, part_idx)
+            repeat_path_idx = repeat_idx if args.num_repeats > 1 else None
+            shard_path = shard_samples_path(shards_output_path, base_name, part_idx, repeat_idx=repeat_path_idx)
+            if args.resume and os.path.exists(final_result_path):
+                progress_queue.put(("skip_shard", device_str, task_name, part_idx))
+                task_queue.task_done()
+                continue
             if args.resume and os.path.exists(shard_path):
-                progress_queue.put(("skip_shard", device_str, base_name, part_idx))
+                progress_queue.put(("skip_shard", device_str, task_name, part_idx))
                 task_queue.task_done()
                 continue
 
         try:
             if not is_shard:
-                progress_queue.put(("start", device_str, base_name))
+                if args.seed_base is not None:
+                    seed = int(args.seed_base) + stable_name_seed_offset(base_name) + repeat_idx
+                    set_seed_all(seed)
+
+                progress_queue.put(("start", device_str, task_name))
                 res = run_one_task_impute(
                     imputer, trainer, spec,
                     num_cells=args.num_samples,
@@ -608,20 +701,21 @@ def worker(device_idx: int, device_str: str, task_queue: mp.Queue, progress_queu
                 )
 
                 # Log and save
-                logging.info(f"Computed metrics for {base_name}: {res}")
-                progress_queue.put(("done", device_str, base_name, res.get('rmse'), res.get('r2'), res.get('scfid')))
-
-                tmp_path = result_path + '.tmp'
-                with open(tmp_path, 'w') as f:
-                    json.dump(res, f, indent=2)
-                os.replace(tmp_path, result_path)
+                logging.info(f"Computed metrics for {task_name}: {res}")
+                progress_queue.put(("done", device_str, task_name, res.get('rmse'), res.get('r2'), res.get('scfid')))
+                save_json_atomic(repeat_path, res)
             else:
                 # Optional deterministic seed per shard
                 if args.seed_base is not None:
-                    seed = int(args.seed_base) + (hash(base_name) % 10_000_000) + int(part_idx)
+                    seed = (
+                        int(args.seed_base)
+                        + stable_name_seed_offset(base_name)
+                        + repeat_idx * max(1, args.setting_workers)
+                        + int(part_idx)
+                    )
                     set_seed_all(seed)
 
-                progress_queue.put(("start_shard", device_str, base_name, part_idx, want))
+                progress_queue.put(("start_shard", device_str, task_name, part_idx, want))
                 shard_samples = compute_imputation_shard_samples(
                     imputer, trainer, spec,
                     num_cells=want,
@@ -629,9 +723,9 @@ def worker(device_idx: int, device_str: str, task_queue: mp.Queue, progress_queu
                     dropout_ratio=args.dropout_ratio,
                     device_str=device_str,
                 )
-                shard_dir = os.path.dirname(shard_samples_path(shards_output_path, base_name, part_idx))
+                shard_dir = os.path.dirname(shard_path)
                 os.makedirs(shard_dir, exist_ok=True)
-                tmp = shard_samples_path(shards_output_path, base_name, part_idx) + '.tmp.npz'
+                tmp = shard_path + '.tmp.npz'
                 # Save counts, imputed, mask, and labels
                 save_kwargs = {
                     'counts': shard_samples['counts'].astype(np.float32),
@@ -642,12 +736,12 @@ def worker(device_idx: int, device_str: str, task_queue: mp.Queue, progress_queu
                 for i, lab in enumerate(shard_samples['labels_list']):
                     save_kwargs[f'label_{i}'] = lab.astype(np.int64)
                 np.savez_compressed(tmp, **save_kwargs)
-                os.replace(tmp, shard_samples_path(shards_output_path, base_name, part_idx))
-                progress_queue.put(("done_shard", device_str, base_name, part_idx, want))
+                os.replace(tmp, shard_path)
+                progress_queue.put(("done_shard", device_str, task_name, part_idx, want))
 
         except Exception as e:
-            logging.exception(f"[GPU {device_str}] ERROR on {base_name}: {e}")
-            progress_queue.put(("error", device_str, base_name, str(e)))
+            logging.exception(f"[GPU {device_str}] ERROR on {task_name}: {e}")
+            progress_queue.put(("error", device_str, task_name, str(e)))
         finally:
             task_queue.task_done()
 
@@ -656,21 +750,22 @@ def main():
     parser = argparse.ArgumentParser(description="Parallel evaluator for scRNA-seq imputation (CountsdiffImputer)")
     parser.add_argument('--gpus', type=str, default=None, help='Comma-separated GPU IDs, e.g., "0,1,2". Omit for single GPU.')
 
-    parser.add_argument('--run-id', required=True, help='Neptune run ID to load model and config')
-    parser.add_argument('--checkpoint', required=False, help='Run checkpoint')
-    parser.add_argument('--num-samples', type=int, default=1024, help='Number of cells per setting to evaluate')
+    parser.add_argument('--run-id', required=True, help='Legacy Neptune ID or W&B run ID to load model and config')
+    parser.add_argument('--checkpoint', type=int, default=None, help='Optional checkpoint number to load instead of best/latest')
+    parser.add_argument('--num-samples', type=int, default=5000, help='Number of cells per setting to evaluate')
     parser.add_argument('--batch-size', type=int, default=512, help='Batch size for imputation calls (internal batching)')
     parser.add_argument('--dropout-ratio', type=float, default=0.4, help='Random dropout ratio for imputation mask (applied on valid positions only)')
 
-    parser.add_argument('--n-steps', type=str, default='100', help='Comma-separated list of step counts, e.g. "100,400"')
-    parser.add_argument('--guidance-scales', type=str, default='1.0', help='Comma-separated list, e.g. "1.0,2.0"')
+    parser.add_argument('--n-steps', type=str, default='20', help='Comma-separated list of step counts, e.g. "100,400"')
+    parser.add_argument('--guidance-scales', type=str, default='0.5', help='Comma-separated list, e.g. "1.0,2.0"')
 
     parser.add_argument('--sigma-methods', type=str, default='rescaled', help='Methods among: none,max,max_capped,rescaled')
     parser.add_argument('--remasking-probs', type=str, default='0.0', help='Used when sigma-method==none')
     parser.add_argument('--eta-caps', type=str, default='0.05', help='Used for max_capped')
-    parser.add_argument('--eta-rescales', type=str, default='0.005', help='Used for rescaled')
+    parser.add_argument('--eta-rescales', type=str, default='0.00', help='Used for rescaled')
     parser.add_argument('--repaint-num-iters', type=str, default='1', help='Comma-separated list of repaint iterations, e.g. "1,3,5"')
     parser.add_argument('--repaint-jumps', type=str, default='1', help='Comma-separated list of repaint jumps, e.g. "1,3,5"')
+    parser.add_argument('--num-repeats', type=int, default=5, help='Repeat each hyperparameter setting this many times and aggregate metrics as mean and standard error')
 
     parser.add_argument('--experiment-name', type=str, required=True, help='Name of the experiment')
     parser.add_argument('--output-path', type=str, default='data/dnadiff/evals/', help='Root path for results')
@@ -687,6 +782,8 @@ def main():
     parser.add_argument('--keep-shards', action='store_true', help='Keep shard files after final aggregation (default: delete)')
 
     args = parser.parse_args()
+    if args.num_repeats < 1:
+        raise ValueError("--num-repeats must be at least 1")
 
     # Parse grids
     steps_list = parse_list(args.n_steps, typ=int) or [100]
@@ -708,7 +805,17 @@ def main():
     os.makedirs(shards_output_path, exist_ok=True)
 
     # Build full list of (base) tasks
-    base_specs = build_tasks(steps_list, guidance_list, methods, remask_list, eta_caps, eta_rescales, repaint_num_iters, repaint_jumps)
+    base_specs = build_tasks(
+        steps_list,
+        guidance_list,
+        methods,
+        remask_list,
+        eta_caps,
+        eta_rescales,
+        repaint_num_iters,
+        repaint_jumps,
+        checkpoint=args.checkpoint,
+    )
 
     # GPU assignment
     if args.gpus is None:
@@ -721,16 +828,18 @@ def main():
     # Queue tasks (support per-setting sharding)
     task_queue: mp.JoinableQueue = mp.JoinableQueue()
     progress_queue: mp.Queue = mp.Queue()
-    if args.setting_workers > 1:
-        for spec in base_specs:
-            for part_idx in range(args.setting_workers):
-                shard_spec = dict(spec)
-                shard_spec['_nparts'] = args.setting_workers
-                shard_spec['_part_idx'] = part_idx
-                task_queue.put(shard_spec)
-    else:
-        for spec in base_specs:
-            task_queue.put(spec)
+    for spec in base_specs:
+        for repeat_idx in range(args.num_repeats):
+            repeat_spec = dict(spec)
+            repeat_spec['_repeat_idx'] = repeat_idx
+            if args.setting_workers > 1:
+                for part_idx in range(args.setting_workers):
+                    shard_spec = dict(repeat_spec)
+                    shard_spec['_nparts'] = args.setting_workers
+                    shard_spec['_part_idx'] = part_idx
+                    task_queue.put(shard_spec)
+            else:
+                task_queue.put(repeat_spec)
     # Sentinel per worker will be added after workers start
 
     # Spawn one worker process per device
@@ -749,7 +858,7 @@ def main():
         task_queue.put(None)
 
     # Monitor progress
-    total = len(base_specs) * (args.setting_workers if args.setting_workers > 1 else 1)
+    total = len(base_specs) * args.num_repeats * (args.setting_workers if args.setting_workers > 1 else 1)
     completed = 0
     bar = tqdm(total=total, desc="Imputation eval tasks")
     while completed < total:
@@ -795,136 +904,178 @@ def main():
     for p in procs:
         p.join()
 
-    # If we sharded per-setting, aggregate shards into final per-setting results
+    # Aggregate per-repeat outputs into final per-setting results.
     if args.setting_workers > 1:
         from tqdm.auto import tqdm as _tqdm
         _tqdm.write("Aggregating per-setting shards into final results...")
         imputer_for_metrics = CountsdiffImputer(run_id=args.run_id, device=str(devices[0] if torch.cuda.is_available() else 'cpu'), checkpoint=args.checkpoint)
         val_ds_for_metrics = imputer_for_metrics.generator.trainer.val_loader.dataset
         gene_names = getattr(val_ds_for_metrics, 'gene_names', None)
+        scfid_metric = None
         if gene_names is not None and args.scvi_model_path is not None and os.path.exists(args.scvi_model_path):
             categorical_covariates = val_ds_for_metrics.get_obs_dict(unique=True)
             scfid_metric = scFID(gene_names=gene_names, categorical_covariates=categorical_covariates, feature_model_path=args.scvi_model_path)
 
         for spec in base_specs:
             base_name = base_name_for(spec)
-            result_path = os.path.join(results_dir, f"{base_name}.json")
+            result_path = aggregated_result_path(results_dir, base_name)
             if args.resume and os.path.exists(result_path):
                 _tqdm.write(f"[Agg skip] {base_name} (result exists)")
                 continue
 
-            shard_dir = os.path.join(shards_output_path, base_name)
-            shard_paths = []
-            if os.path.isdir(shard_dir):
-                for i in range(args.setting_workers):
-                    shard_paths.append(shard_samples_path(shards_output_path, base_name, i))
-            if not shard_paths or not all(os.path.exists(p) for p in shard_paths):
-                _tqdm.write(f"[Agg warn] Missing shards for {base_name}; skipping")
+            repeat_results: List[Dict[str, Any]] = []
+            cleanup_paths: List[str] = []
+            ok = True
+
+            for repeat_idx in range(args.num_repeats):
+                repeat_label_name = task_label(base_name, repeat_idx, args.num_repeats)
+                repeat_path_idx = repeat_idx if args.num_repeats > 1 else None
+                shard_paths = [
+                    shard_samples_path(shards_output_path, base_name, i, repeat_idx=repeat_path_idx)
+                    for i in range(args.setting_workers)
+                ]
+                if not all(os.path.exists(p) for p in shard_paths):
+                    _tqdm.write(f"[Agg warn] Missing shards for {repeat_label_name}; skipping {base_name}")
+                    ok = False
+                    break
+
+                counts_parts: List[np.ndarray] = []
+                imputed_parts: List[np.ndarray] = []
+                mask_parts: List[np.ndarray] = []
+                labels_parts: Optional[List[List[np.ndarray]]] = None
+
+                for sp in shard_paths:
+                    try:
+                        with np.load(sp, allow_pickle=False) as d:
+                            counts_parts.append(d['counts'])
+                            imputed_parts.append(d['imputed'])
+                            mask_parts.append(d['impute_mask'].astype(np.bool_))
+                            n_labels = int(d['n_labels']) if 'n_labels' in d else 0
+                            shard_labels = []
+                            for i in range(n_labels):
+                                shard_labels.append(d[f'label_{i}'])
+                            if labels_parts is None:
+                                labels_parts = [[] for _ in range(n_labels)]
+                            if n_labels != len(labels_parts):
+                                raise ValueError("Inconsistent number of label arrays across shards")
+                            for i, arr in enumerate(shard_labels):
+                                labels_parts[i].append(arr)
+                    except Exception as e:
+                        logging.warning(f"Failed to load shard {sp}: {e}")
+                        ok = False
+                        break
+                if not ok:
+                    break
+
+                all_counts = np.concatenate(counts_parts, axis=0)
+                all_imputed = np.concatenate(imputed_parts, axis=0)
+                all_mask = np.concatenate(mask_parts, axis=0).astype(np.bool_)
+                if all_counts.shape[0] > args.num_samples:
+                    all_counts = all_counts[:args.num_samples]
+                    all_imputed = all_imputed[:args.num_samples]
+                    all_mask = all_mask[:args.num_samples]
+                    if labels_parts is not None:
+                        labels_parts = [np.concatenate(x, axis=0)[:args.num_samples] for x in labels_parts]
+                else:
+                    if labels_parts is not None:
+                        labels_parts = [np.concatenate(x, axis=0) for x in labels_parts]
+
+                cov_df = val_ds_for_metrics.build_covariate_df(labels_parts)
+                try:
+                    eval_metrics = summarize_eval_metrics(
+                        imputed=all_imputed,
+                        raw_data=all_counts,
+                        impute_mask=all_mask,
+                        covariates=cov_df,
+                        scfid_metric=scfid_metric,
+                        device_str=str(imputer_for_metrics.device),
+                    )
+                except Exception as e:
+                    logging.warning(f"Metric aggregation failed for {repeat_label_name}: {e}")
+                    ok = False
+                    break
+
+                repeat_res = build_result_metadata(spec, args.dropout_ratio)
+                repeat_res.update(eval_metrics)
+                repeat_results.append(repeat_res)
+                cleanup_paths.extend(shard_paths)
+
+            if not ok or not repeat_results:
                 continue
 
-            # Load shards and concatenate samples
-            counts_parts: List[np.ndarray] = []
-            imputed_parts: List[np.ndarray] = []
-            mask_parts: List[np.ndarray] = []
-            labels_parts: Optional[List[List[np.ndarray]]] = None
+            res = aggregate_repeat_metrics(
+                spec,
+                dropout_ratio=args.dropout_ratio,
+                repeat_results=repeat_results,
+            )
+            save_json_atomic(result_path, res)
+            scfid_value = res.get('scfid')
+            _tqdm.write(
+                f"[Agg] {base_name} -> RMSE={res['rmse']:.4f}±{res['rmse_se']:.4f} "
+                f"R2={res['r2']:.4f}±{res['r2_se']:.4f}"
+                + (f" scFID={scfid_value:.3f}±{res['scfid_se']:.3f}" if scfid_value is not None else "")
+            )
 
+            # Optionally clean up shards
+            if not args.keep_shards:
+                for sp in cleanup_paths:
+                    try:
+                        os.remove(sp)
+                    except Exception:
+                        pass
+                cleanup_dirs = sorted(
+                    {os.path.dirname(sp) for sp in cleanup_paths} | {os.path.join(shards_output_path, base_name)},
+                    reverse=True,
+                )
+                for shard_dir in cleanup_dirs:
+                    try:
+                        if os.path.isdir(shard_dir) and not os.listdir(shard_dir):
+                            os.rmdir(shard_dir)
+                    except Exception:
+                        pass
+    else:
+        from tqdm.auto import tqdm as _tqdm
+        _tqdm.write("Aggregating per-setting repeats into final results...")
+        for spec in base_specs:
+            base_name = base_name_for(spec)
+            result_path = aggregated_result_path(results_dir, base_name)
+            if args.resume and os.path.exists(result_path):
+                _tqdm.write(f"[Agg skip] {base_name} (result exists)")
+                continue
+
+            repeat_paths = [
+                repeat_result_path(results_dir, base_name, repeat_idx)
+                for repeat_idx in range(args.num_repeats)
+            ]
+            if not all(os.path.exists(p) for p in repeat_paths):
+                _tqdm.write(f"[Agg warn] Missing repeat results for {base_name}; skipping")
+                continue
+
+            repeat_results: List[Dict[str, Any]] = []
             ok = True
-            for sp in shard_paths:
+            for repeat_path in repeat_paths:
                 try:
-                    with np.load(sp, allow_pickle=False) as d:
-                        counts_parts.append(d['counts'])
-                        imputed_parts.append(d['imputed'])
-                        mask_parts.append(d['impute_mask'].astype(np.bool_))
-                        n_labels = int(d['n_labels']) if 'n_labels' in d else 0
-                        shard_labels = []
-                        for i in range(n_labels):
-                            shard_labels.append(d[f'label_{i}'])
-                        if labels_parts is None:
-                            labels_parts = [[] for _ in range(n_labels)]
-                        if n_labels != len(labels_parts):
-                            raise ValueError("Inconsistent number of label arrays across shards")
-                        for i, arr in enumerate(shard_labels):
-                            labels_parts[i].append(arr)
+                    with open(repeat_path, 'r') as f:
+                        repeat_results.append(json.load(f))
                 except Exception as e:
-                    logging.warning(f"Failed to load shard {sp}: {e}")
+                    logging.warning(f"Failed to load repeat result {repeat_path}: {e}")
                     ok = False
                     break
             if not ok:
                 continue
 
-            all_counts = np.concatenate(counts_parts, axis=0)
-            all_imputed = np.concatenate(imputed_parts, axis=0)
-            all_mask = np.concatenate(mask_parts, axis=0).astype(np.bool_)
-            if all_counts.shape[0] > args.num_samples:
-                all_counts = all_counts[:args.num_samples]
-                all_imputed = all_imputed[:args.num_samples]
-                all_mask = all_mask[:args.num_samples]
-                if labels_parts is not None:
-                    labels_parts = [np.concatenate(x, axis=0)[:args.num_samples] for x in labels_parts]
-            else:
-                if labels_parts is not None:
-                    labels_parts = [np.concatenate(x, axis=0) for x in labels_parts]
-
-            # Compute RMSE and R2 on masked entries
-            imputed_vals = all_imputed[all_mask].astype(np.float64)
-            actual_vals = all_counts[all_mask].astype(np.float64)
-            n_total = max(1, imputed_vals.size)
-            sse_total = float(np.sum((imputed_vals - actual_vals) ** 2.0))
-            rmse = float(np.sqrt(sse_total / n_total))
-            mean_actual = float(np.mean(actual_vals)) if n_total > 0 else 0.0
-            ss_tot = float(np.sum((actual_vals - mean_actual) ** 2.0))
-            r2 = float(1.0 - (sse_total / (ss_tot + 1e-12)))
-
-            # Compute scFID from aggregated samples if possible
-            scfid_value = None
-            try:
-                cov_df = val_ds_for_metrics.build_covariate_df(labels_parts)
-                scfid_metric.update(all_counts, cov_df, True)
-                scfid_metric.update(all_imputed, cov_df, False)
-                scfid_value = float(scfid_metric.compute().item())
-                scfid_metric.reset()
-            except Exception as e:
-                logging.warning(f"scFID aggregation failed for {base_name}: {e}")
-
-            res = {
-                'n_steps': int(spec['n_steps']),
-                'guidance_scale': float(spec['guidance_scale']),
-                'sigma_method': spec['sigma_method'],
-                'dropout_ratio': float(args.dropout_ratio),
-                'rmse': float(rmse),
-                'r2': float(r2),
-            }
-            if scfid_value is not None:
-                res['scfid'] = float(scfid_value)
-            if spec['sigma_method'] == 'none':
-                res['remasking_prob'] = float(spec['remasking_prob'])
-            elif spec['sigma_method'] == 'max_capped':
-                res['eta_cap'] = float(spec['eta_cap'])
-            elif spec['sigma_method'] == 'rescaled':
-                res['eta_rescale'] = float(spec['eta_rescale'])
-            if 'repaint_num_iters' in spec and spec['repaint_num_iters'] is not None:
-                res['repaint_num_iters'] = int(spec['repaint_num_iters'])
-            if 'repaint_jumps' in spec and spec['repaint_jumps'] is not None:
-                res['repaint_jump'] = int(spec['repaint_jumps'])
-
-            tmp_path = result_path + '.tmp.npz'
-            with open(tmp_path, 'w') as f:
-                json.dump(res, f, indent=2)
-            os.replace(tmp_path, result_path)
-            _tqdm.write(f"[Agg] {base_name} -> RMSE={rmse:.4f} R2={r2:.4f}" + (f" scFID={scfid_value:.3f}" if scfid_value is not None else ""))
-
-            # Optionally clean up shards
-            if not args.keep_shards:
-                for sp in shard_paths:
-                    try:
-                        os.remove(sp)
-                    except Exception:
-                        pass
-                try:
-                    if os.path.isdir(shard_dir) and not os.listdir(shard_dir):
-                        os.rmdir(shard_dir)
-                except Exception:
-                    pass
+            res = aggregate_repeat_metrics(
+                spec,
+                dropout_ratio=args.dropout_ratio,
+                repeat_results=repeat_results,
+            )
+            save_json_atomic(result_path, res)
+            scfid_value = res.get('scfid')
+            _tqdm.write(
+                f"[Agg] {base_name} -> RMSE={res['rmse']:.4f}±{res['rmse_se']:.4f} "
+                f"R2={res['r2']:.4f}±{res['r2_se']:.4f}"
+                + (f" scFID={scfid_value:.3f}±{res['scfid_se']:.3f}" if scfid_value is not None else "")
+            )
 
     if not args.no_aggregate:
         aggregate_path = os.path.join(exp_output_path, 'imputation-sweep.json')

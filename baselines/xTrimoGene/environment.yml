@@ -1,0 +1,17 @@
+name: xtrimogene-baseline
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - h5py
+  - tqdm
+  - pytorch=2.2.*
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1

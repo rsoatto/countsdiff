@@ -7,10 +7,12 @@ import pickle
 import torch
 import numpy as np
 from typing import Dict, Iterable, List, Any, Optional, Union
+from tqdm import tqdm
 
 from .sampling import generate_samples, generate_samples_jump
 from ..training import trainer
 from ..config.config import Config
+from ..utils.tracking import resolve_run_reference
 
 
 class CountsdiffGenerator:
@@ -30,8 +32,13 @@ class CountsdiffGenerator:
                 raise ValueError("Either input_trainer or run_id must be provided")
             if config_override is not None:
                 self.config = config_override
+                if "run_name" not in self.config or "checkpoint_subdir" not in self.config:
+                    resolved_run = resolve_run_reference(run_id)
+                    self.config.setdefault("run_name", resolved_run.run_name)
+                    self.config.setdefault("checkpoint_subdir", resolved_run.checkpoint_subdir)
+                    self.config.setdefault("tracking", resolved_run.config.get("tracking", {}))
             else:
-                self.config = Config.load_from_neptune(run_id, project_name='countsdiff-iclr/ICLR')
+                self.config = Config.load_from_run(run_id)
             self.run_id = run_id
 
             self.trainer = trainer.CountsdiffTrainer(self.config, run_id=run_id, legacy_model=legacy_model, eval_mode=True)
@@ -62,6 +69,19 @@ class CountsdiffGenerator:
             print(f"Loaded model checkpoint from {checkpoint_path}")
         else:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    def _build_observation_times(self, n_steps: int) -> torch.Tensor:
+        if self.trainer.continuous_training:
+            # Preserve the long-standing continuous-time contract:
+            # `n_steps` is the number of observation points.
+            return torch.from_numpy(np.linspace(1, 0, n_steps).astype(np.float32))
+
+        assert n_steps == self.trainer.T, (
+            "n_steps must match training n_steps for discrete training"
+        )
+        # Discrete training uses the exact grid t = k / T for k in [1, T].
+        # Sampling should therefore visit 1, (T-1)/T, ..., 1/T, 0.
+        return torch.arange(n_steps, -1, -1, dtype=torch.float32) / n_steps
     
     def generate_samples(self, num_samples: int, n_steps: int = 1000, device='cuda', remasking_prob = 0.00, guidance_scale = 0.0, labels=None, valid_mask=None, batch_size=None, random_rounding=True, poisson_sampling: bool = False,
                         *, sigma_method: Optional[str] = None, sigma_kwargs: Optional[Dict[str, Any]] = None, sigma_per_token: Optional[torch.Tensor] = None, **kwargs) -> np.ndarray:
@@ -100,11 +120,8 @@ class CountsdiffGenerator:
             self.device = device
             self.trainer.ema.store(self.model.parameters())
             self.trainer.ema.copy_to(self.model.parameters())
-            
-            if self.trainer.continuous_training == False:
-                assert n_steps == self.trainer.T, "n_steps must match training n_steps for discrete training"
-            
-            observation_times = torch.from_numpy(np.linspace(1, 0, n_steps + 1).astype(np.float32))
+
+            observation_times = self._build_observation_times(n_steps)
             sample_image = self.trainer.val_loader.dataset[0]
             if isinstance(sample_image, (list, tuple)):
                 sample_image = sample_image[0]
@@ -227,8 +244,8 @@ class CountsdiffGenerator:
             self.device = device
             self.trainer.ema.store(self.model.parameters())
             self.trainer.ema.copy_to(self.model.parameters())
-            
-            observation_times = torch.from_numpy(np.linspace(1, 0, n_steps).astype(np.float32))
+
+            observation_times = self._build_observation_times(n_steps)
 
             # Allow model to attend on imputed points
             valid_mask = torch.ones_like(counts, dtype=torch.bool) if valid_mask is None else (valid_mask + impute_mask).bool()
@@ -268,7 +285,7 @@ class CountsdiffGenerator:
                 # Batched data imputation
                 all_samples = []
                     
-                for i in range(0, counts.shape[0], batch_size):
+                for i in tqdm(range(0, counts.shape[0], batch_size), desc="Batched imputation"):
                     end_idx = min(i + batch_size, counts.shape[0])
                     batch_labels = None
                     if labels is not None:
@@ -301,6 +318,8 @@ class CountsdiffGenerator:
                         sigma_kwargs=sigma_kwargs,
                         sigma_per_token=sigma_per_token,
                         random_rounding=random_rounding,
+                        repaint_num_iters=repaint_num_iters,
+                        repaint_jump=repaint_jump,
                         device=str(self.device),
                         trainer=self.trainer
                     )

@@ -33,14 +33,14 @@ else:
     ]
 
 setup(
-    name="counstdiff",
+    name="countsdiff",
     version="0.1.0",
-    author="Anonymous",
-    author_email="Anonymous",
+    author="Renzo G. Soatto",
+    author_email="",
     description="CountsDiff: Diffusion on the natural numbers for imputation and generation of count-based data",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/anonymous/counstdiff",
+    url="https://github.com/rsoatto/countsdiff",
     packages=find_packages(where="src") + find_packages(include=("baselines", "baselines.*", "scripts", "scripts.*"))
 ,
     package_dir={"": "src",
@@ -70,8 +70,8 @@ setup(
             "jupyter>=1.0",
             "notebook>=6.0",
         ],
-        "neptune": [
-            "neptune-client>=0.16.0",
+        "wandb": [
+            "wandb>=0.25.0",
         ],
     },
     entry_points={

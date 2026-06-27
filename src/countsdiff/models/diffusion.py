@@ -175,7 +175,9 @@ class AttentionWrapper(nn.Module):
         
         
         for i, (name, embedder) in enumerate(self.embedders):
-            label = class_labels[i] if i < len(class_labels) else None
+            label = None
+            if class_labels is not None and i < len(class_labels):
+                label = class_labels[i]
             if label is not None:
                 label_embs = embedder(label).unsqueeze(1)
                 if uncond_mask is not None:

@@ -434,7 +434,7 @@ def main():
     parser = argparse.ArgumentParser(description="Parallel evaluator for blackout diffusion (CIFAR-10)")
     parser.add_argument('--gpus', type=str, default=None, help='Comma-separated GPU IDs, e.g., "0,1,2". Omit for single GPU.')
 
-    parser.add_argument('--run-id', required=True, help='Neptune run ID to load model and config')
+    parser.add_argument('--run-id', required=True, help='Legacy Neptune ID or W&B run ID to load model and config')
     parser.add_argument('--checkpoint', required=False, help='Run checkpoint')
     parser.add_argument('--num-samples', type=int, default=5000, help='Number of samples to generate per setting')
     parser.add_argument('--batch-size', type=int, default=500, help='Batch size for generation and metrics')

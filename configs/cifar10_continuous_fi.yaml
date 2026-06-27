@@ -51,8 +51,7 @@ generation:
   remasking_prob: 0.0
   sigma_method: null
   guidance_scale: 1.5
-# Neptune logging (optional)
-neptune:
-  project: null            # Set to your Neptune project
-  api_token: null          # Set NEPTUNE_API_TOKEN env var
+# Weights & Biases logging (optional); entity/project are set in
+# countsdiff/utils/tracking.py. Set enabled: true to log training runs.
+wandb:
   enabled: false

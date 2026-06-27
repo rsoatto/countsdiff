@@ -24,8 +24,8 @@ matplotlib>=3.4.0
 seaborn>=0.11.0
 ipykernel
 
-# Experiment tracking (optional)
-neptune-client>=0.16.0
+# Experiment tracking (required: imported by countsdiff.utils.tracking)
+wandb>=0.25.0
 
 # Development and testing
 pytest>=6.2.0

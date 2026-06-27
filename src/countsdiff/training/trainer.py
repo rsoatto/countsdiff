@@ -9,11 +9,9 @@ from torch.utils.data import DataLoader, random_split, TensorDataset
 from tqdm import tqdm
 import numpy as np
 from typing import Dict, Any, Iterable, Optional, Tuple
-import neptune
 import datetime as dt
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
-from neptune.utils import stringify_unsupported
 import pandas as pd
 import h5py
 import anndata
@@ -23,9 +21,15 @@ from countsdiff.models.ema import ExponentialMovingAverage
 from countsdiff.data.datasets import create_cifar10_loaders, create_celeba_loaders
 from countsdiff.training.utils import build_jump_linear_beta_schedule, legacy_blackout_config_to_buffers
 from countsdiff.utils.metrics import scFID
+from countsdiff.utils.tracking import (
+    WANDB_ENTITY,
+    WANDB_PROJECT,
+    build_logged_config,
+    init_wandb_tracker,
+    resolve_run_reference,
+)
 
-# Neptune handler API token
-NEPTUNE_API_TOKEN = "eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiI2NmJiYTkzOC00YTI1LTRhZmYtYmI0NS0zYjEzOGJlYjE1ZDkifQ=="
+
 
 class CountsdiffTrainer:
     """Trainer for count diffusion models"""
@@ -146,63 +150,115 @@ class CountsdiffTrainer:
 
         
         print(f"Trainer initialized on device {self.device}")
-        
-        config = {
+
+        tracker_config = self.config.get('tracking', {})
+        if not isinstance(tracker_config, dict):
+            tracker_config = {}
+        legacy_wandb_config = self.config.get('wandb', {})
+        if not isinstance(legacy_wandb_config, dict):
+            legacy_wandb_config = {}
+        if legacy_wandb_config:
+            merged_tracker_config = legacy_wandb_config.copy()
+            merged_tracker_config.update(tracker_config)
+            tracker_config = merged_tracker_config
+            self.config['tracking'] = tracker_config
+
+        tracking_enabled = tracker_config.get('enabled', True)
+        if isinstance(tracking_enabled, str):
+            tracking_enabled = tracking_enabled.strip().lower() not in {"0", "false", "no", "off", "none", ""}
+        else:
+            tracking_enabled = bool(tracking_enabled)
+
+        resolved_run = None
+        resolved_wandb_run_id = tracker_config.get('wandb_run_id')
+        resolved_wandb_run_path = tracker_config.get('wandb_run_path')
+        legacy_run_id = tracker_config.get('legacy_run_id')
+        display_name = tracker_config.get('display_name')
+
+        if run_id and not resolved_wandb_run_id:
+            resolved_run = resolve_run_reference(run_id)
+            resolved_wandb_run_id = resolved_run.run_id
+            resolved_wandb_run_path = resolved_run.run_path
+            legacy_run_id = resolved_run.legacy_run_id
+            display_name = resolved_run.display_name
+            self.config.setdefault('run_name', resolved_run.run_name)
+            self.config.setdefault('checkpoint_subdir', resolved_run.checkpoint_subdir)
+            self.config['tracking'] = resolved_run.config.get('tracking', {})
+            tracker_config = self.config['tracking']
+        tracker_config['enabled'] = tracking_enabled
+
+        unique_run_name = (
+            self.config.get('run_name')
+            or tracker_config.get('run_name')
+            or f"countsdiff_{self.dataset_type}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        checkpoint_subdir = (
+            self.config.get('checkpoint_subdir')
+            or tracker_config.get('checkpoint_subdir')
+            or unique_run_name
+        )
+
+        base_logged_config = {
             'model': self.model_config,
             'data': self.data_config,
             'scheduler': self.scheduler_config,
             'training': self.training_config,
             'generation': self.generation_config,
+            'tracking': tracker_config,
         }
-        
-                # Initialize Neptune run if available
-        if 'NEPTUNE_API_TOKEN' in os.environ:
-            if run_id:
-                # Resume from specific run
-                self.run = neptune.init_run(
-                    with_id=run_id,
-                    api_token=NEPTUNE_API_TOKEN, #service account token for loading runs
-                    project="countsdiff-iclr/ICLR",
-                    source_files=["src/**.py"],
-                    capture_hardware_metrics=False,
-                    mode="read-only" if eval_mode else "async",
-                )
-                unique_run_name = self.run["config/run_name"].fetch()
-                
-                config["run_name"] = unique_run_name
-                config = stringify_unsupported(config)
-                if not eval_mode:
-                    # Update config to include default values
-                    del self.run["config"]
-                    self.run["config"] = config
-                print(f"Resuming Neptune run {run_id} with name {unique_run_name}")
-            else:
-                unique_run_name = f"countsdiff_{self.dataset_type}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                self.run = neptune.init_run(
-                    name=unique_run_name,
-                    api_token=NEPTUNE_API_TOKEN,
-                    project="countsdiff-iclr/ICLR",
-                    source_files=["src/**.py"],
-                    capture_hardware_metrics=False,
-                    mode = "debug" if self.training_config.get('debug', True) else "async",  # Use debug mode if specified
-                    tags=config["training"].get("tags", None)
-                )
-                config["run_name"] = unique_run_name
-                self.run["config"] = stringify_unsupported(config)
+
+        logged_config = build_logged_config(
+            base_logged_config,
+            run_name=unique_run_name,
+            checkpoint_subdir=checkpoint_subdir,
+            wandb_run_id=resolved_wandb_run_id,
+            wandb_run_path=resolved_wandb_run_path,
+            legacy_run_id=legacy_run_id,
+            display_name=display_name,
+        )
+
+        self.tracker = None
+        self.run = None
+        if eval_mode:
+            print(f"Using public W&B metadata for evaluation run {run_id or unique_run_name}")
         else:
-            print("Neptune API token not found in environment. Proceeding without experiment tracking.")
-            unique_run_name = f"local_{self.dataset_type}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.run = neptune.init_run(
-                name=unique_run_name,
-                project="countsdiff-iclr/ICLR",
-                mode="offline"
-            )
-            config["run_name"] = unique_run_name
-            self.run["config"] = config
-                
-        
+            if not tracking_enabled:
+                print("W&B tracking disabled by config")
+            elif run_id:
+                if not resolved_wandb_run_id:
+                    raise RuntimeError(f"Unable to resolve W&B run ID for '{run_id}'")
+                print(f"Resuming W&B run {run_id} with local run name {unique_run_name}")
+                self.tracker = init_wandb_tracker(
+                    logged_config=logged_config,
+                    tags=self.training_config.get("tags", None),
+                    resume_run_id=resolved_wandb_run_id,
+                )
+            else:
+                self.tracker = init_wandb_tracker(
+                    logged_config=logged_config,
+                    tags=self.training_config.get("tags", None),
+                    display_name=unique_run_name,
+                )
+
+            if self.tracker is not None:
+                self.run = self.tracker.run
+                logged_config = build_logged_config(
+                    base_logged_config,
+                    run_name=unique_run_name,
+                    checkpoint_subdir=checkpoint_subdir,
+                    wandb_run_id=self.run.id,
+                    wandb_run_path=f"{WANDB_ENTITY}/{WANDB_PROJECT}/{self.run.id}",
+                    legacy_run_id=legacy_run_id,
+                    display_name=self.run.name,
+                )
+                self.tracker.update_config(logged_config)
+
+        self.config['run_name'] = unique_run_name
+        self.config['checkpoint_subdir'] = checkpoint_subdir
+        self.config['tracking'] = logged_config.get('tracking', {})
+
         checkpoint_base_dir = self.training_config.get('checkpoint_dir', 'checkpoints')
-        self.checkpoint_dir = os.path.join(checkpoint_base_dir, unique_run_name)
+        self.checkpoint_dir = os.path.join(checkpoint_base_dir, checkpoint_subdir)
         self.random_seed = self.training_config.get('random_seed', 42)
         
         self.setup_data()
@@ -240,7 +296,10 @@ class CountsdiffTrainer:
         if self._inst_weights is None:
             raise ValueError("Legacy blackout weights not initialized")
         num_steps = self._inst_weights.shape[0]
-        t_index = (t * num_steps).long()
+        # Discrete training samples t = k / T for k in [1, T]; map that to
+        # zero-based weight indices [0, T-1] robustly under float roundoff.
+        t_index = torch.round(t * num_steps).long() - 1
+        t_index = t_index.clamp_(min=0, max=num_steps - 1)
         return self._inst_weights[t_index]
 
     def blackout_weight_scheduler_continuous(self, t: torch.Tensor,  t_T: torch.Tensor = torch.Tensor([15.])) -> torch.Tensor:
@@ -262,26 +321,6 @@ class CountsdiffTrainer:
                 return_labels=self.conditional_training
             )
             print(f"Loaded CIFAR-10 dataset")
-            # Build legacy blackout schedule buffers if requested
-            if self.scheduler_config.get('scheduler', '') in ['blackout']:
-                self._inst_obs_times, self._inst_sampling_prob, self._inst_weights = \
-                    legacy_blackout_config_to_buffers(self.config, self.device)
-            if self.scheduler_config.get('scheduler', '') in ['jump']:
-                # For jump scheduler, no legacy buffers needed
-                _, self._p_schedule, lmd = build_jump_linear_beta_schedule(
-                    T=self.scheduler_config.get('T', 1000),
-                    beta_start=self.scheduler_config.get('beta_start', 1e-3),
-                    logsnr_start=self.scheduler_config.get('logsnr_start', 10.0),
-                    logsnr_end=self.scheduler_config.get('logsnr_end', -12.0),
-                    signal_stat=self.scheduler_config.get('signal_stat', 1.0),
-                    lbd=self.scheduler_config.get('lbd', None),
-                    device=self.device
-                )
-                self.scheduler_config['lbd'] = lmd
-                if self.poisson_randomization:
-                    print("Jump scheduler initialized with lbd =", lmd)
-                else:
-                    print("Binomial JUMP scheduler initialized (no poisson randomization)")
         elif self.dataset_type == 'celeba':
             # Setup CelebA data loaders (same image pipeline)
             self.train_loader, self.val_loader = create_celeba_loaders(
@@ -302,6 +341,27 @@ class CountsdiffTrainer:
             self.setup_scrna_data()
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
+        
+                    # Build legacy blackout schedule buffers if requested
+        if self.scheduler_config.get('scheduler', '') in ['blackout']:
+            self._inst_obs_times, self._inst_sampling_prob, self._inst_weights = \
+                legacy_blackout_config_to_buffers(self.config, self.device)
+        if self.scheduler_config.get('scheduler', '') in ['jump']:
+            # For jump scheduler, no legacy buffers needed
+            _, self._p_schedule, lmd = build_jump_linear_beta_schedule(
+                T=self.scheduler_config.get('T', 1000),
+                beta_start=self.scheduler_config.get('beta_start', 1e-3),
+                logsnr_start=self.scheduler_config.get('logsnr_start', 10.0),
+                logsnr_end=self.scheduler_config.get('logsnr_end', -12.0),
+                signal_stat=self.scheduler_config.get('signal_stat', 1.0),
+                lbd=self.scheduler_config.get('lbd', None),
+                device=self.device
+            )
+            self.scheduler_config['lbd'] = lmd
+            if self.poisson_randomization:
+                print("Jump scheduler initialized with lbd =", lmd)
+            else:
+                print("Binomial JUMP scheduler initialized (no poisson randomization)")
 
         print(f"Created data loaders: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} val batches")
@@ -602,7 +662,7 @@ class CountsdiffTrainer:
         device: str = 'cuda',
         remasking_prob: float = 0.0,
         guidance_scale: float = 0.0,
-        log_to_neptune: bool = True,
+        log_to_wandb: bool = True,
         batch_size: int = 500,
         num_workers: int = 4,
         **kwargs
@@ -672,11 +732,16 @@ class CountsdiffTrainer:
         self.fid.reset()
         self.is_score.reset()
 
-        if log_to_neptune and getattr(self, "run", None) is not None:
-            print(f"Logging FID: {fid_value}, IS(mean): {is_mean}, IS(std): {is_std} to Neptune")
-            self.run["val/fid"].append(value=fid_value, step=self.state['step'])
-            self.run["val/is_mean"].append(value=is_mean, step=self.state['step'])
-            self.run["val/is_std"].append(value=is_std, step=self.state['step'])
+        if log_to_wandb and self.tracker is not None and self.tracker.enabled:
+            print(f"Logging FID: {fid_value}, IS(mean): {is_mean}, IS(std): {is_std} to W&B")
+            self.tracker.log_metrics(
+                {
+                    "val/fid": fid_value,
+                    "val/is_mean": is_mean,
+                    "val/is_std": is_std,
+                },
+                step=self.state['step'],
+            )
         else:
             print(f"FID: {fid_value}, IS(mean): {is_mean}, IS(std): {is_std}")
 
@@ -690,25 +755,36 @@ class CountsdiffTrainer:
         device: str = 'cuda',
         remasking_prob: float = 0.0,
         guidance_scale: float = 1.0,
-        log_to_neptune: bool = True,
+        log_to_wandb: bool = True,
         batch_size: int = 500,
         num_workers: int = 4,
         **kwargs
     ) -> Tuple[float, float, float]:
         """Generates samples and computes FID/IS. Returns (FID, IS_mean, IS_std)."""
-        
+
+        def _get_scfid_batch(dataset, batch_size: int, shuffle: bool):
+            original_return_labels = getattr(dataset, "return_labels", None)
+            if original_return_labels is not None:
+                dataset.return_labels = True
+            try:
+                loader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle
+                )
+                return next(iter(loader))
+            finally:
+                if original_return_labels is not None:
+                    dataset.return_labels = original_return_labels
+
         print(f"Generating {num_samples} samples")
         with torch.inference_mode():
-            gen_loader = DataLoader(
-            self.val_loader.dataset,
-            batch_size=num_samples,
-            shuffle=True
-        )
-            gen_batch = next(iter(gen_loader))
-            valid_mask=(~gen_batch[2]).to(self.device).bool()
+            gen_batch = _get_scfid_batch(self.val_loader.dataset, num_samples, shuffle=True)
+            _, gen_labels, gen_missing_mask, _ = self._unpack_scrna_batch(gen_batch)
+            valid_mask = (~gen_missing_mask).to(self.device).bool()
             gen = generator.generate_samples(
                 num_samples=num_samples,
-                labels=gen_batch[1],
+                labels=gen_labels,
                 n_steps=n_steps,
                 device=device,
                 valid_mask=valid_mask,
@@ -721,17 +797,16 @@ class CountsdiffTrainer:
                 # ensure metrics are on GPU
         self.scfid = self.scfid.to(self.device).eval()
         full_dataset = self.train_loader.dataset
-        train_data = next(iter(DataLoader(
+        train_data = _get_scfid_batch(
             self.train_loader.dataset,
             batch_size=min(num_samples, len(self.train_loader.dataset)),
             shuffle=False,
-        )))
-        train_counts=train_data[0]
-        train_labels = train_data[1] if self.conditional_training else None
+        )
+        train_counts, train_labels, _, _ = self._unpack_scrna_batch(train_data)
         covariate_df = full_dataset.build_covariate_df(train_labels)
         self.scfid.reset()
         self.scfid.update(train_counts.cpu().numpy(), covariate_df, True)
-        val_labels = [cat_label.to(self.device) for cat_label in gen_batch[1]]
+        val_labels = None if gen_labels is None else [cat_label.to(self.device) for cat_label in gen_labels]
         val_covariate_df = full_dataset.build_covariate_df(val_labels)
         self.scfid.update(gen.cpu().numpy(), val_covariate_df, False)
 
@@ -739,9 +814,9 @@ class CountsdiffTrainer:
 
         self.scfid.reset()
 
-        if log_to_neptune and getattr(self, "run", None) is not None:
-            print(f"Logging FID: {fid_score} to Neptune")
-            self.run["val/fid"].append(value=fid_score, step=self.state['step'])
+        if log_to_wandb and self.tracker is not None and self.tracker.enabled:
+            print(f"Logging FID: {fid_score} to W&B")
+            self.tracker.log_metrics({"val/fid": fid_score}, step=self.state['step'])
         else:
             print(f"FID: {fid_score}")
 
@@ -753,8 +828,25 @@ class CountsdiffTrainer:
         """Setup single-cell RNA-seq data loaders"""
         from ..data.process_scrna import SingleCellDataset
 
-        self.train_dataset = SingleCellDataset(self.data_path, split = "train", condition_keys=self.data_config.get('condition_keys', []))
-        self.val_dataset = SingleCellDataset(self.data_path, split = "val", condition_keys = self.data_config.get('condition_keys', []))
+        condition_keys = self.data_config.get('condition_keys', []) or []
+        self.train_dataset = SingleCellDataset(
+            self.data_path,
+            split="train",
+            condition_keys=condition_keys,
+            return_labels=self.conditional_training,
+        )
+        self.val_dataset = SingleCellDataset(
+            self.data_path,
+            split="val",
+            condition_keys=condition_keys,
+            return_labels=self.conditional_training,
+        )
+
+        if self.conditional_training and not self.train_dataset.condition_keys:
+            raise ValueError(
+                "Conditional scRNA training was requested, but no condition keys were loaded from the dataset."
+            )
+
         for key in self.train_dataset.condition_keys:
             print(f"Categorical key '{key}' has {self.train_dataset.get_num_classes(key)} classes")
         
@@ -777,25 +869,57 @@ class CountsdiffTrainer:
         
         # Store dataset info for model setup
         self.num_genes = self.train_dataset.counts.shape[1]
-        self.all_num_classes = [self.train_dataset.get_num_classes(key) for key in self.train_dataset.condition_keys]
+        if self.conditional_training:
+            self.all_num_classes = [self.train_dataset.get_num_classes(key) for key in self.train_dataset.condition_keys]
+        else:
+            self.all_num_classes = []
         
         print(f"Created data loaders: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} val batches")
 
-    def generate_scrna_batch_data(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, torch.Tensor, Iterable[torch.Tensor], torch.Tensor]:
+    def _unpack_scrna_batch(
+        self,
+        batch: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, Optional[Iterable[torch.Tensor]], torch.Tensor, Optional[torch.Tensor]]:
+        """Unpack scRNA batches with or without conditioning labels."""
+        if not isinstance(batch, (list, tuple)):
+            raise TypeError(f"Expected scRNA batch to be a tuple/list, got {type(batch)}")
+
+        if len(batch) >= 3 and isinstance(batch[1], (list, tuple)):
+            counts = batch[0]
+            labels = batch[1]
+            missing_mask = batch[2]
+            target_mask = batch[3] if len(batch) > 3 else None
+        else:
+            counts = batch[0]
+            labels = None
+            missing_mask = batch[1]
+            target_mask = batch[2] if len(batch) > 2 else None
+
+        return counts, labels, missing_mask, target_mask
+
+    def generate_scrna_batch_data(
+        self,
+        batch: Tuple[torch.Tensor, ...]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Iterable[torch.Tensor]], torch.Tensor, torch.Tensor]:
         """Generate noised batch data for scRNA-seq"""
         with torch.no_grad():
-            counts, labels, missing_mask = batch
+            counts, labels, missing_mask, _ = self._unpack_scrna_batch(batch)
             valid_mask = ~missing_mask
             # Move to device
             counts = counts.to(self.device).float()
             valid_mask = valid_mask.to(self.device).bool()
-            labels = [lbl.to(self.device).long() for lbl in labels]
+            if labels is not None:
+                labels = [lbl.to(self.device).long() for lbl in labels]
             
             
             # Sample timesteps
             batch_size = counts.shape[0]
-            t = torch.rand(batch_size, device=self.device)
+            if self.continuous_training:
+                t = torch.rand(batch_size, device=self.device)
+            else:
+                k = torch.randint(low=1, high=self.T + 1, size=(batch_size,), device=self.device)
+                t = k.float() / self.T
             
             noised_counts, p_t = self.corrupt_data(counts, t)
             
@@ -969,14 +1093,16 @@ class CountsdiffTrainer:
             if self.dataset_type in ('cifar10', 'celeba'):
                 loss = self.train_step_cifar10(batch)
                 self.state['lossHistory'].append(loss)
-                self.run["train/loss"].append(value=loss, step=step)
+                if self.tracker is not None and self.tracker.enabled:
+                    self.tracker.log_metrics({"train/loss": loss}, step=step)
                 # Evaluate periodically
                 log_freq = self.training_config.get('log_freq', 100)
                 eval_freq = self.training_config.get('eval_freq', 5000)
                 if step % log_freq == 0:
                     val_loss = self.validate_cifar10()
                     self.state['evalLossHistory'].append(val_loss)
-                    self.run["val/loss"].append(value=val_loss, step=step)
+                    if self.tracker is not None and self.tracker.enabled:
+                        self.tracker.log_metrics({"val/loss": val_loss}, step=step)
                     current_epoch_estimate = step / steps_per_epoch
                     log_message = f"Step {step}/{self.n_steps}, Loss: {loss:.6f}, Val Loss: {val_loss:.6f}"
                     if step % eval_freq == 0 and step >= self.training_config.get('start_eval', 10000):
@@ -987,14 +1113,16 @@ class CountsdiffTrainer:
             elif self.dataset_type == 'scrna':
                 loss = self.train_step_scrna(batch)
                 self.state['lossHistory'].append(loss)
-                self.run["train/loss"].append(value=loss, step=step)
+                if self.tracker is not None and self.tracker.enabled:
+                    self.tracker.log_metrics({"train/loss": loss}, step=step)
                 
                 # Evaluate periodically
                 log_freq = self.training_config.get('log_freq', 100)
                 if step % log_freq == 0:
                     val_loss = self.validate_scrna()
                     self.state['evalLossHistory'].append(val_loss)
-                    self.run["val/loss"].append(value=val_loss, step=step)
+                    if self.tracker is not None and self.tracker.enabled:
+                        self.tracker.log_metrics({"val/loss": val_loss}, step=step)
                     current_epoch_estimate = step / steps_per_epoch
                     print(f"Step {step}/{self.n_steps} (≈ epoch {current_epoch_estimate:.2f}/{estimated_epochs:.2f}), "
                           f"Loss: {loss:.6f}, Val Loss: {val_loss:.6f}")
@@ -1006,7 +1134,11 @@ class CountsdiffTrainer:
             else:
                 raise ValueError(f"Unknown dataset type: {self.dataset_type}")
             
-            # Save checkpoint
+            # Update step counter
+            self.state['step'] = step + 1
+
+            # Save checkpoints after advancing the persisted step so resume does
+            # not replay the just-finished iteration.
             if step % self.snapshot_freq_preemption == 0:
                 self.save_checkpoint(checkpoint_path)
                 
@@ -1018,9 +1150,6 @@ class CountsdiffTrainer:
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
-            
-            # Update step counter
-            self.state['step'] = step + 1
         
         # Final checkpoint save
         print("Training completed!")
@@ -1040,7 +1169,8 @@ class CountsdiffTrainer:
         self.state['step'] = self.n_steps
         self.save_checkpoint(os.path.join(self.checkpoint_dir, f'final.pth'))
         
-        self.run.stop()
+        if self.tracker is not None:
+            self.tracker.finish()
         
         print(f"Training complete after {self.n_steps} steps!")
     

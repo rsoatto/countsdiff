@@ -1,1 +1,11 @@
-data/
+# Data, checkpoints, and results (downloaded via scripts/download_data.sh).
+# Anchored so it does NOT match the src/countsdiff/data package.
+/data/*
+!/data/.gitkeep
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/

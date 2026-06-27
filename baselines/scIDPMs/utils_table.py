@@ -160,18 +160,21 @@ def evaluate(model, test_loader, nsample=1000, scaler=1, mean_scaler=0, folderna
     print("RMSE:", torch.mean(torch.sqrt(torch.div(mse_total, evalpoints_total))).item(), )
 
 
-def genera(model, genera_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", max_arr=None, attention_mech='', gene_names = None):
+def genera(model, genera_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", max_arr=None, attention_mech='', gene_names = None, seed=0):
     if max_arr is None:
         max_arr = np.array([])
-    torch.manual_seed(0)
-    np.random.seed(0)
+    # seed=None lets the caller's RNG state govern (used for distinct multiple imputations);
+    # otherwise reseed for reproducibility.
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     imputed_samples = []
     observed_data_all = []
     cond_mask_all = []
     observed_mask_all = []
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast('cuda'):
         model.eval()
 
         with tqdm(genera_loader, mininterval=5.0, maxinterval=50.0) as it:
