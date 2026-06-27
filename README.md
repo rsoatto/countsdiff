@@ -79,9 +79,7 @@ project used for logging are defined in `src/countsdiff/utils/tracking.py`.
 Imputation baselines live under `baselines/` and are run through
 `scripts/generate_multiple_imputation.py` via `--baseline-model`: `magic`, `gain`,
 `hivae`, `scidpm`, `remdm`, `forestdiff`, `scgpt_scratch` / `scgpt_pretrained`, and
-`xtrimogene`. scGPT and xTrimoGene are vendored as code only — download their
-pretrained weights from the respective upstream model zoos and point the wrappers at
-them.
+`xtrimogene`.
 
 ## Citation
 
